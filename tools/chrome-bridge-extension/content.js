@@ -149,6 +149,22 @@
     readLatestAssistantSnapshot: (...args) => readLatestAssistantSnapshot(...args),
     send,
   });
+  // Display-only incremental text. It reads the same canonical snapshot the final
+  // answer comes from, so status chrome ("Worked for ...", "Thinking...", Copy
+  // and Run controls) can never reach a delta. Durable state is untouched.
+  const RESPONSE_STREAM_FACTORY = globalThis.ChatGptResponseStreamRuntime;
+  if (!RESPONSE_STREAM_FACTORY) throw new Error('ChatGPT response stream runtime module was not loaded before content.js');
+  const responseStream = RESPONSE_STREAM_FACTORY.createResponseStream({
+    getActiveRequest: (...args) => getActiveRequest(...args),
+    send,
+  });
+  subscribeTabObservation((observation) => {
+    try {
+      responseStream.observe(observation);
+    } catch (error) {
+      diagnostic('response.stream.failed', { message: error?.message || String(error) });
+    }
+  });
   const REQUEST_TELEMETRY_FACTORY = globalThis.ChatGptRequestTelemetry;
   if (!REQUEST_TELEMETRY_FACTORY) throw new Error('ChatGPT request telemetry module was not loaded before content.js');
   const {
@@ -310,7 +326,7 @@
     releaseRequest, scheduleCollect, startDomMonitor, getCurrentSession,
     conversationIdFromUrl, handleSessionsList, handleSessionsNew, handleSessionsSelect, handleSessionsDelete,
     handleBrowserTabOpen, handleBrowserTabClose, handleBrowserOwnedTabClose, handleBrowserTabIdentify, handleBrowserTabReload, handleExtensionReload,
-    applyModelOptions, applySessionOptions, chatPageReadiness, waitForChatPageReady, waitForDocumentReady, readIntelligenceState, handleModelsList,
+    applyModelOptions, applySessionOptions, chatPageReadiness, waitForChatPageReady, waitForDocumentReady, readIntelligenceState, reportIntelligenceMetrics, handleModelsList,
     handleEffortsList, handleIntelligenceApply, handleResponseRecoverLatest, handleResponseRecoverList,
     handleResponseRecoverTurnKey, handleResponseSnapshotRequest, handleArtifactFetch,
   } = featureRuntime;
@@ -392,12 +408,16 @@
     simpleHash,
     startDomMonitor,
     turnKey,
+    // The recovery resolver must classify turns with the same layout-aware
+    // resolver the submission path uses; legacy data-turn attributes no longer
+    // exist on the current ChatGPT conversation DOM.
+    turnRole,
     waitForChatPageReady,
     waitForDocumentReady,
     waitForSubmittedUserTurnAnchor,
-    pagePresence,
+    pagePresence, reportIntelligenceMetrics,
     readIntelligenceState,
-    readSubmittedUserTurnError,
+    readSubmittedUserTurnError, readUserTurnPromptText,
   });
   const { handlePassivePromptSubmit, handlePromptCancel, handlePromptSend, handlePromptSteer,
     handleRequestRelease, handleRequestResume, handleEffectReconcile } = requestCommandsApi;

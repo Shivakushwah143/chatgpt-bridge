@@ -768,6 +768,29 @@ function isCodeBlockChromeElement(element) {
   return structural || action || (languages.length > 0 && text.length <= 100);
 }
 
+// Long-running turns render progress chrome inside the assistant turn
+// ("Worked for 11m 23s", "Thought for 4m 12s", "Thinking…") next to the final
+// answer. That chrome describes the turn, never the answer, so it must not
+// become response content even though it is visible text in the message.
+const ASSISTANT_STATUS_TEXT = /^(?:worked|working|thought|thinking|reasoning|analy[sz]ed|analy[sz]ing|processing|searched|searching|ran|running|read|reading|browsing|думал|думаю|размышлял|размышляю)(?:\s+(?:for|on|through)\b[^.!?]{0,48})?(?:\s*(?:\.{2,}|…))?$/i;
+const ASSISTANT_CHROME_TEXT = /^(?:copy(?: code| response)?|copied|share|retry|regenerate|run(?: code)?|execute(?: code)?|edit|download|open|save|preview|full screen|копировать|скопировано|поделиться|повторить|запустить|выполнить|редактировать|скачать|открыть|сохранить|предпросмотр)$/i;
+
+function isAssistantStatusText(value = '') {
+  const text = normalizeText(value);
+  return Boolean(text) && text.length <= 80 && (ASSISTANT_STATUS_TEXT.test(text) || ASSISTANT_CHROME_TEXT.test(text));
+}
+
+function isAssistantStatusBlock(block) {
+  if (!block || block.type === 'code_block' || !block._element) return false;
+  if (!isAssistantStatusText(block.text || '')) return false;
+  const element = block._element;
+  const statusUi = Boolean(element.matches?.('[role="status"], [aria-live], [aria-busy="true"]')
+    || element.closest?.('[role="status"], [aria-live], [class*="shimmer"], [class*="text-token-text-tertiary"]'));
+  // Markdown response content is the answer even when it reads like a label.
+  if (!statusUi && element.closest?.('.markdown, [class*="MarkdownRoot"]')) return false;
+  return true;
+}
+
 function extractFinalAnswer(finalNode, excludedRoots = []) {
   if (!finalNode) return { answer: '', format: 'none', responseBlocks: [], codeBlocks: [], codeBlockDiagnostics: [], parserAudit: null };
   const exclusions = (Array.isArray(excludedRoots) ? excludedRoots : []).filter(Boolean);
@@ -812,7 +835,8 @@ function extractFinalAnswer(finalNode, excludedRoots = []) {
       ownerCandidatesEnumerated: passMetrics.reduce((sum, item) => sum + Number(item.ownerCandidatesEnumerated || 0), 0),
     };
   }
-  const responseBlocks = extractedBlocks.map(({ _languageDiagnostic, _codeInspection, _blockDiagnostic, _element, _ownedLeaves, ...block }) => ({
+  const answerBlocks = extractedBlocks.filter((block) => !isAssistantStatusBlock(block));
+  const responseBlocks = answerBlocks.map(({ _languageDiagnostic, _codeInspection, _blockDiagnostic, _element, _ownedLeaves, ...block }) => ({
     ...block,
     ...(block.type === 'code_block' ? { diagnostic: _languageDiagnostic || null } : _blockDiagnostic ? { diagnostic: _blockDiagnostic } : {}),
   }));

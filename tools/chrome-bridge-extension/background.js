@@ -2,6 +2,7 @@ import { authorizeBridgeHttpRequest, performHttp } from './background/httpTransp
 import {
   BackgroundStateStore,
   createRuntimeEpoch,
+  pendingReleaseDeadlines,
 } from './background/stateV6.js';
 import {
   MessageType,
@@ -128,6 +129,13 @@ function scheduleReleaseDeadline(state, commandId, timeoutMs = 8_000) {
   }, Math.max(1_000, Number(timeoutMs) || 8_000));
   timer.unref?.();
   releaseDeadlineTimers.set(key, timer);
+}
+function armPersistedReleaseDeadlines(state, runtime) {
+  for (const deadline of pendingReleaseDeadlines(runtime)) {
+    // Re-arming derives the one existing deadline from persisted state, so a
+    // release whose in-memory timer was lost still reaches a single terminal.
+    scheduleReleaseDeadline(state, deadline.commandId, Math.max(1_000, deadline.dueAt - Date.now()));
+  }
 }
 notifyBackgroundStateChanged = async (tabId) => {
   const state = [...connections.values()].find((candidate) => candidate.tabId === tabId && !candidate.closed) || null;
@@ -258,6 +266,7 @@ function connectWebSocket(port, config) {
   }).then((outcome) => {
     if (!outcome.accepted) throw new Error(`Unable to attach content runtime: ${outcome.reason}`);
     restoreDownloadCapturesForPort(port, outcome.state);
+    armPersistedReleaseDeadlines(state, outcome.state);
     return openConnection(state);
   }).catch((err) => post(port, { type: 'extension.error', message: err.message || String(err) }));
 }
@@ -290,6 +299,7 @@ async function openConnection(state) {
         type: 'transport.connected', connectionEpoch: state.connectionEpoch, contentEpoch: state.contentEpoch,
       });
       if (!connected.accepted) throw new Error(`Unable to persist transport connection: ${connected.reason}`);
+      armPersistedReleaseDeadlines(state, connected.state);
       const [launchMeta, runtime] = await Promise.all([state.launchMetaPromise, backgroundState.read(state.tabId)]);
       post(state.port, {
         type: 'extension.connected',

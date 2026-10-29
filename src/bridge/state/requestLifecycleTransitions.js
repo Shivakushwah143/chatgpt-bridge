@@ -49,14 +49,22 @@ export function reduceRequestLifecycleTransition(state, event) {
         }), event),
         effects: [], deadlines: [], diagnostics: [],
       };
-    case RequestEventType.PROMPT_SUBMITTED:
+    case RequestEventType.PROMPT_SUBMITTED: {
+      // The content runtime proves the submitted user turn during prompt.submit
+      // admission; that proof is the request's response boundary and must survive
+      // a content reload that happens while ChatGPT creates the conversation.
+      const submittedUserTurnKey = String(data.submittedUserTurnKey || data.userTurnKey || '');
+      const next = applyLifecyclePatch(state, {
+        lifecycle: RequestLifecycle.SUBMITTED,
+        submission: SubmissionState.SUBMITTED,
+      });
       return {
-        state: updateProgressTimestamp(applyLifecyclePatch(state, {
-          lifecycle: RequestLifecycle.SUBMITTED,
-          submission: SubmissionState.SUBMITTED,
-        }), event),
+        state: updateProgressTimestamp(submittedUserTurnKey
+          ? { ...next, response: { ...next.response, userTurnKey: submittedUserTurnKey } }
+          : next, event),
         effects: [], deadlines: [], diagnostics: [],
       };
+    }
     case RequestEventType.RESPONSE_BOUNDARY_REBOUND:
       return {
         state: appendDiagnostics({
@@ -64,12 +72,41 @@ export function reduceRequestLifecycleTransition(state, event) {
           response: {
             ...(state.response || {}),
             userTurnKey: String(data.submittedUserTurnKey || state.response?.userTurnKey || ''),
+            boundaryRecovery: null,
           },
         }, [{
           code: 'response_boundary_rebound',
           message: String(data.message || 'Submitted user-turn identity changed after content reload and was rebound by exact prompt evidence'),
           data,
         }]),
+        effects: [], deadlines: [], diagnostics: [],
+      };
+    case RequestEventType.RESPONSE_BOUNDARY_PENDING:
+      // A reloaded page that has not painted the submitted turn yet is not
+      // proof that the turn is gone. Record the bounded recovery attempt, keep
+      // the request alive, and let the recovery owner retry with fresh
+      // evidence before any terminal decision is made.
+      return {
+        state: updateProgressTimestamp(appendDiagnostics({
+          ...state,
+          response: {
+            ...(state.response || {}),
+            boundaryRecovery: {
+              attempt: Math.max(1, Number(data.attempt) || 1),
+              submittedUserTurnKey: String(data.submittedUserTurnKey || state.response?.userTurnKey || ''),
+              submittedUserTurnIndex: Number(data.submittedUserTurnIndex ?? -1),
+              assistantTurnKey: String(data.assistantTurnKey || ''),
+              reasonCode: String(data.reasonCode || 'SUBMITTED_TURN_NOT_RENDERED_AFTER_RELOAD'),
+              deadlineAt: Math.max(0, Number(data.deadlineAt) || 0),
+              evidence: data.evidence || null,
+              at,
+            },
+          },
+        }, [{
+          code: 'response_boundary_pending',
+          message: String(data.message || 'The submitted user turn is not rendered yet after content reload; canonical recovery is retrying'),
+          data,
+        }]), event),
         effects: [], deadlines: [], diagnostics: [],
       };
     case RequestEventType.RESPONSE_BOUNDARY_LOST:

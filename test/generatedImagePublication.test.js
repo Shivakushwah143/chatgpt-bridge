@@ -85,7 +85,14 @@ test('canonical completion publishes only after image capture settles', async ()
   artifacts.set(candidate.id, candidate);
   const state = { artifacts: [candidate], deferredDone: { answer: '' } };
   let published;
-  const materializer = new RequestResultMaterializer({ artifacts });
+  // Minimal owner contract: this test only observes the publication seam, and
+  // terminal completion releases lease ownership before it publishes.
+  const materializer = new RequestResultMaterializer({
+    artifacts,
+    runtime: { clear() {} },
+    pending: new Map(),
+    releaseClientOwnership: async () => ({ attempted: false, released: false, reason: 'no_client_binding' }),
+  });
   materializer.finish = (_state, error, _answer, metadata) => { assert.equal(error, null); published = metadata; };
   const pending = materializer.finishFromCanonicalState(state, { terminal: { code: 'completed' } });
   await waitFor(() => resolveCapture);

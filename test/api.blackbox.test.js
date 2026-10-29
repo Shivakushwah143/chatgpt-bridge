@@ -154,7 +154,17 @@ async function startFixture() {
       const body = type.includes('application/json') ? await response.json() : await response.text();
       return { response, body };
     },
-    async close() { await new Promise((resolve) => server.close(resolve)); },
+    async close() {
+      // Close keep-alive and streaming connections before waiting on the server:
+      // server.close() waits for every open connection, and a cancelled SSE
+      // response can leave that wait pending with nothing left on the event loop
+      // ("Promise resolution is still pending but the event loop has already
+      // resolved"). Closing the fixture's sqlite handle keeps each test from
+      // leaving a native handle behind as well.
+      server.closeAllConnections?.();
+      await new Promise((resolve) => server.close(() => resolve()));
+      await metadataStore.db?.close?.();
+    },
   };
 }
 
@@ -234,7 +244,7 @@ test('Setup page exposes extension-only diagnostics and authentication', async (
 
     const diagStream = await fetch(`${fx.baseUrl}/setup/debug/stream?limit=1`);
     assert.equal(diagStream.status, 200);
-    diagStream.body?.cancel?.();
+    await diagStream.body?.cancel?.();
   } finally {
     await fx.close();
   }
@@ -495,6 +505,7 @@ test('Chat, sessions, models, efforts, artifacts and OpenAI-compatible routes wo
     });
     assert.equal(completion.response.status, 200);
     assert.equal(completion.body.choices[0].message.content, 'answer');
+    assert.equal(fx.bridge.requests.at(-1).dedicatedTab, true, 'OpenAI-compatible agent traffic must use a dedicated agent tab');
 
     fx.bridge.artifacts = [{ id: 'artifact_zip', name: 'out.zip', mime: 'application/zip', contentBase64: Buffer.from('zipdata').toString('base64') }];
     const artifacts = await fx.request('/artifacts');

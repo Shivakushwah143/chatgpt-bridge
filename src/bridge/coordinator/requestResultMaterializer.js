@@ -150,7 +150,7 @@ export class RequestResultMaterializer {
         }), { canonical: false });
       }
       if (owner.artifacts.settled) state.artifacts = await owner.artifacts.settled(state.artifacts);
-      this.finish(state, null, String(deferred.answer || state.answer || ''), {
+      await this.completeTerminal(state, code, null, String(deferred.answer || state.answer || ''), {
         ...(deferred.metadata || {}),
         artifacts: state.artifacts,
         finishReason: deferred.metadata?.finishReason || 'canonical_completion',
@@ -159,7 +159,7 @@ export class RequestResultMaterializer {
     }
 
     if (code === RequestTerminalCode.CANCELLED) {
-      this.finish(state, abortError(terminal.message || 'Request cancelled'), '', { finishReason: 'cancelled' });
+      await this.completeTerminal(state, code, abortError(terminal.message || 'Request cancelled'), '', { finishReason: 'cancelled' });
       return;
     }
 
@@ -212,16 +212,50 @@ export class RequestResultMaterializer {
         });
       }
     }
-    this.finish(state, error, '', {
+    await this.completeTerminal(state, code, error, '', {
       finishReason: code === RequestTerminalCode.SOURCE_LOST ? 'recoverable_failed' : 'canonical_state_failure',
     });
   }
 
-  finish(state, err, answer = '', metadata = {}) {
+  /**
+   * Terminal completion is ordered: materialize the exact response snapshot,
+   * release the browser lease, then publish. A request must never be observable
+   * as settled while the tab it owned is still leased to it.
+   */
+  async completeTerminal(state, code, err, answer, metadata) {
+    if (!this.materialize(state, err, answer, metadata)) return;
+    try {
+      await this.owner.releaseClientOwnership(state, {
+        terminalCode: String(code || ''),
+        reason: err?.message || metadata?.finishReason || String(code || 'request_terminal'),
+        source: 'terminal_materialization',
+      });
+    } finally {
+      // The response was already materialized above, so publishing here can
+      // never observe a partially built result.
+      this.finish(state, err, answer, metadata);
+    }
+  }
+
+  /**
+   * Closes the request exactly once and stores the response that is about to be
+   * published. It never resolves the public promise: that happens after cleanup.
+   */
+  materialize(state, err, answer = '', metadata = {}) {
     const owner = this.owner;
-    if (!markRequestRuntimeFinished(state)) return;
+    if (!markRequestRuntimeFinished(state)) return false;
     this.cleanupState(state);
     owner.pending.delete(state.requestId);
+    state.pendingPublication = { err: err || null, answer: String(answer || ''), metadata: metadata || {} };
+    return true;
+  }
+
+  publish(state) {
+    const owner = this.owner;
+    const publication = state?.pendingPublication;
+    if (!publication) return;
+    state.pendingPublication = null;
+    const { err, answer, metadata } = publication;
 
     if (err) {
       const eventType = err.recoverable || metadata.finishReason === 'recoverable_failed' ? 'request.recoverable_failed' : 'request.error';
@@ -298,6 +332,12 @@ export class RequestResultMaterializer {
     }
     state.followers?.clear();
     state.resolve(response);
+  }
+
+  /** Materializes when needed, then publishes. Publication is idempotent. */
+  finish(state, err, answer = '', metadata = {}) {
+    if (state?.pendingPublication) this.publish(state);
+    else if (this.materialize(state, err, answer, metadata)) this.publish(state);
   }
 
   cleanupState(state) {

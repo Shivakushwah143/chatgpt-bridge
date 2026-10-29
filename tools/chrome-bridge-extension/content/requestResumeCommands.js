@@ -28,6 +28,7 @@
       isGenerating,
       markRequestProgress,
       normalizeText,
+      readUserTurnPromptText,
       refreshRequestTurnAnchors,
       registerPassivePromptBoundary,
       releaseRequest,
@@ -44,6 +45,7 @@
       simpleHash,
       startDomMonitor,
       turnKey,
+      turnRole: resolveTurnRole,
       waitForChatPageReady,
       waitForDocumentReady,
       waitForSubmittedUserTurnAnchor,
@@ -54,7 +56,16 @@
     const { publicRequestStatus } = deps;
     if (typeof publicRequestStatus !== 'function') throw new TypeError('Request resume commands require publicRequestStatus');
 
+    // Turn roles must come from the same layout-aware resolver the submission
+    // path uses. The current ChatGPT conversation DOM has no data-turn/
+    // data-message-author-role wrapper on user turns (they are
+    // [data-chatgpt-search-message-ids] nodes) and assistant turns only hang off
+    // [data-chatgpt-agent-turn-start], so reading the legacy attributes alone
+    // classified every turn as role-less during recovery: the submitted prompt
+    // could never be proved present and a live request was declared lost.
     function turnRole(turn) {
+      const resolved = typeof resolveTurnRole === 'function' ? String(resolveTurnRole(turn) || '') : '';
+      if (resolved) return resolved;
       return String(turn?.getAttribute?.('data-turn')
         || turn?.querySelector?.('[data-message-author-role]')?.getAttribute?.('data-message-author-role')
         || turn?.getAttribute?.('data-message-author-role')
@@ -66,25 +77,108 @@
       return typeof normalizeText === 'function' ? normalizeText(value) : value.trim().replace(/\s+/g, ' ');
     }
 
+    // Comparable prompt text: whitespace differences between the submitted
+    // string and the rendered bubble must not hide a submitted turn.
+    function comparableText(value) {
+      return String(value || '').replace(/\s+/g, ' ').trim();
+    }
+    // ChatGPT collapses long user messages into a shortened preview followed by
+    // a "Show more" control, so the rendered bubble is an exact prefix of the
+    // submitted prompt plus a truncation marker.
+    function withoutTruncationMarker(value) {
+      return String(value || '')
+        .replace(/\s*(?:…|\.{3})\s*(?:show more|read more|показать полностью|показать целиком)?\s*$/i, '')
+        .trim();
+    }
+    // A truncated preview is only proof when it is long enough to identify the
+    // prompt; short prompts still require exact text.
+    const MIN_TRUNCATED_PROMPT_PREFIX = 64;
+
+    // Submission proves the user turn with DOM_PARSER.userTurnMatchesExpectedText
+    // against the bubble text. Recovery after a content reload must use the same
+    // predicate, otherwise a turn whose anchor id changed across the reload is
+    // declared lost even though it is visibly the submitted prompt.
+    function promptEvidence(rendered, expectedText) {
+      const actual = comparableText(rendered);
+      if (!actual) return '';
+      if (actual === expectedText) return 'exact';
+      const matches = DOM_PARSER?.userTurnMatchesExpectedText;
+      if (typeof matches === 'function' && matches(actual, expectedText) === true) return 'similar';
+      // The full submitted prompt followed by rendered UI such as "Show more".
+      if (actual.startsWith(expectedText)) return 'prompt_with_trailing_ui';
+      // A collapsed preview of the submitted prompt.
+      const prefix = withoutTruncationMarker(actual);
+      if (prefix.length >= MIN_TRUNCATED_PROMPT_PREFIX && expectedText.startsWith(prefix)) return 'truncated_prefix';
+      return '';
+    }
+
+    // Identity of the rendered turn list. A boundary verdict is only evidence
+    // when this list has stopped changing: a page that renders nothing yet, or
+    // that keeps re-rendering during the whole resolution window, cannot prove
+    // that a submitted turn is gone.
+    function turnListSignature(records = []) {
+      return records.map((record) => `${record.role}:${record.key}:${String(record.text || '').length}`).join('|');
+    }
+
     function projectedBoundaryEvidence(projection = {}) {
-      const records = Array.from(getTurnNodes?.() || []).map((turn, index) => ({
-        turn,
-        index,
-        key: String(turnKey?.(turn, index) || ''),
-        role: turnRole(turn),
-        text: turnText(turn),
-      }));
+      const records = Array.from(getTurnNodes?.() || []).map((turn, index) => {
+        const role = turnRole(turn);
+        // Read user turns from the prompt bubble exactly like submission does;
+        // the turn container also holds action labels that are not the prompt.
+        const promptText = role === 'user' && typeof readUserTurnPromptText === 'function'
+          ? String(readUserTurnPromptText(turn) || '')
+          : '';
+        return {
+          turn,
+          index,
+          key: String(turnKey?.(turn, index) || ''),
+          role,
+          text: promptText || turnText(turn),
+        };
+      });
       const expectedKey = String(projection.submittedUserTurnKey || '');
-      const expectedText = typeof normalizeText === 'function'
-        ? normalizeText(String(projection.submittedPromptText || ''))
-        : String(projection.submittedPromptText || '').trim().replace(/\s+/g, ' ');
+      const expectedText = comparableText(projection.submittedPromptText || '');
       let user = records.find((record) => record.role === 'user' && record.key === expectedKey) || null;
       let status = user ? 'matched' : '';
+      let promptMatch = '';
       if (!user && expectedText) {
-        user = records.filter((record) => record.role === 'user' && record.text === expectedText).at(-1) || null;
-        if (user) status = 'rebound';
+        const userRecords = records.filter((record) => record.role === 'user');
+        const lastUserIndex = userRecords.at(-1)?.index ?? -1;
+        const candidate = userRecords.at(-1) || null;
+        const evidence = candidate ? promptEvidence(candidate.text, expectedText) : '';
+        // The submitted turn is the newest user turn; matching an older turn
+        // would rebind the response to the wrong prompt.
+        if (candidate && candidate.index === lastUserIndex && evidence) {
+          user = candidate;
+          promptMatch = evidence;
+          status = 'rebound';
+        }
       }
       if (!user) {
+        // A still-rendered assistant turn proves the request's response after a
+        // reload when the user bubble is virtualized away entirely. When other
+        // user turns are present but none is the submitted prompt, the boundary
+        // stays ambiguous and is reported missing on purpose.
+        const expectedAssistantKey = String(projection.assistantTurnKey || '');
+        const assistantOnly = expectedAssistantKey && !records.some((record) => record.role === 'user')
+          ? records.find((record) => record.role === 'assistant' && record.key === expectedAssistantKey) || null
+          : null;
+        if (assistantOnly) {
+          return {
+            status: 'rebound',
+            submittedUserTurnKey: expectedKey,
+            submittedUserTurnIndex: Number(projection.submittedUserTurnIndex ?? -1),
+            assistantTurnKey: assistantOnly.key,
+            assistantTurnIndex: assistantOnly.index,
+            evidence: {
+              expectedKey,
+              assistantOnly: true,
+              matchedAssistantKey: assistantOnly.key,
+              turnCount: records.length,
+              turnSignature: turnListSignature(records),
+            },
+          };
+        }
         return {
           status: 'missing',
           submittedUserTurnKey: expectedKey,
@@ -96,6 +190,7 @@
             expectedPromptLength: expectedText.length,
             turnCount: records.length,
             userTurnCount: records.filter((record) => record.role === 'user').length,
+            turnSignature: turnListSignature(records),
           },
         };
       }
@@ -116,8 +211,11 @@
           expectedKey,
           matchedKey: user.key,
           exactKeyMatch: user.key === expectedKey,
-          promptTextMatched: Boolean(expectedText && user.text === expectedText),
+          promptTextMatched: Boolean(promptMatch),
+          promptTextMatch: promptMatch || 'key',
+          truncatedPromptPrefix: promptMatch === 'truncated_prefix',
           turnCount: records.length,
+          turnSignature: turnListSignature(records),
         },
       };
     }
@@ -134,11 +232,26 @@
       await waitForChatPageReady?.(activeRequest, { stage: 'request.resume', timeoutMs: 5_000, settleMs: 300 });
       const startedAt = Date.now();
       let result = projectedBoundaryEvidence(projection);
+      const firstSignature = String(result.evidence?.turnSignature || '');
       const timeoutMs = Math.max(0, Number(resumeBoundaryTimeoutMs) || 0);
       while (result.status === 'missing' && Date.now() - startedAt < timeoutMs) {
         if (typeof delay === 'function') await delay(150);
         else await new Promise((resolve) => setTimeout(resolve, 150));
         result = projectedBoundaryEvidence(projection);
+      }
+      if (result.status === 'missing') {
+        // A negative read is proof only when the conversation surface had
+        // already settled. An empty surface, or a turn list that kept changing
+        // for the whole window, is a page that is still painting after the
+        // reload and cannot be used to declare the submitted turn lost.
+        const lastSignature = String(result.evidence?.turnSignature || '');
+        const settled = Boolean(lastSignature) && lastSignature === firstSignature;
+        result.evidence = {
+          ...(result.evidence || {}),
+          settled,
+          waitedMs: Date.now() - startedAt,
+          firstTurnSignature: firstSignature,
+        };
       }
       return result;
     }

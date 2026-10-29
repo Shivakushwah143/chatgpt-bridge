@@ -44,8 +44,26 @@ function normalizedConversationId(value = '') {
   return id === 'new' ? '' : id;
 }
 
+function decodedConversationId(value = '') {
+  const raw = String(value || '').trim();
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 function isTemporaryConversationId(value = '') {
   return /^WEB:/i.test(normalizedConversationId(value));
+}
+
+// Ids the tab reports before ChatGPT has a real conversation id for the tab.
+// They may legitimately be replaced by the real id of the conversation this
+// request is creating.
+function isPlaceholderConversationId(value = '') {
+  const id = decodedConversationId(value);
+  if (!id) return true;
+  return /^WEB:/i.test(id) || /^local-chatgpt:/i.test(id);
 }
 
 function conversationBoundaryMatches({
@@ -144,6 +162,7 @@ export function tabObservationToCanonicalEvent(
   currentState = null,
   at = 0,
   envelope = null,
+  context = {},
 ) {
   const observation = observationPayload(payload);
   if (!requestId || !observation) return null;
@@ -170,23 +189,59 @@ export function tabObservationToCanonicalEvent(
     });
   const responseBoundaryEstablished = directResponseBoundary || steerContinuationBoundary;
   const responseAppliesToRequest = observationAppliesToRequest && responseBoundaryEstablished;
-  const requestReplaced = Boolean(bindingEstablished && observedRequestId && observedRequestId !== requestId);
+  // A capture produced by the request the tab ran *before* this one is a stale
+  // view, not a replacement: sequential turns on one dedicated tab keep the
+  // previous request visible until the new prompt is painted. Only a request
+  // without a proven terminal state can replace an active one.
+  const observedRequestTerminal = context?.observedRequestTerminal === true;
+  const requestReplaced = Boolean(
+    bindingEstablished
+    && observedRequestId
+    && observedRequestId !== requestId
+    && !observedRequestTerminal
+  );
   const conversationIdChanged = Boolean(
     bindingEstablished
     && expectedConversationId
     && observedConversationId
     && expectedConversationId !== observedConversationId
   );
+  // Exact page evidence that the visible user turn is the one this request submitted.
+  // The content client's own submitted key is bookkeeping, not page evidence, so it
+  // can never promote a conversation on its own.
+  const observedSubmittedTurnMatches = Boolean(
+    observationAppliesToRequest
+    && submittedUserTurnKey
+    && observedUserTurnKey
+    && submittedUserTurnKey === observedUserTurnKey
+  );
+  // A conversation id that changes before the page exposes any turn evidence cannot
+  // be judged yet. ChatGPT creates the real conversation id while the tab is still
+  // navigating, so failing here would reject the request before its own response
+  // exists. Keep the previously bound id and wait for turn evidence instead.
+  const conversationCanonicalizationDeferred = Boolean(
+    conversationIdChanged
+    && observationAppliesToRequest
+    && isPlaceholderConversationId(expectedConversationId)
+    && !observedUserTurnKey
+    && !contentSubmittedUserTurnKey
+  );
   const conversationCanonicalized = Boolean(
     conversationIdChanged
-    && isTemporaryConversationId(expectedConversationId)
-    && !isTemporaryConversationId(observedConversationId)
-    && conversationBoundaryMatches({
-      observationAppliesToRequest,
-      submittedUserTurnKey,
-      contentSubmittedUserTurnKey,
-      observedUserTurnKey,
-    })
+    && (
+      observedSubmittedTurnMatches
+      || conversationCanonicalizationDeferred
+      || (
+        isTemporaryConversationId(expectedConversationId)
+        && !isTemporaryConversationId(observedConversationId)
+        && conversationBoundaryMatches({
+          observationAppliesToRequest,
+          submittedUserTurnKey,
+          contentSubmittedUserTurnKey,
+          observedUserTurnKey,
+        })
+      )
+    )
   );
   const conversationChanged = conversationIdChanged && !conversationCanonicalized;
   const occurredAt = Number(observation.observedAt || payload.observedAt || at) || 0;
@@ -200,7 +255,9 @@ export function tabObservationToCanonicalEvent(
   return createRequestEvent(RequestEventType.OBSERVATION_UPDATED, requestId, {
     clientId,
     url: observation.url || payload.url || '',
-    conversationId: bindingEstablished ? observation.conversationId || payload.session?.id || '' : '',
+    conversationId: bindingEstablished && !conversationCanonicalizationDeferred
+      ? observation.conversationId || payload.session?.id || ''
+      : '',
     observationEpoch: String(envelope?.source?.contentEpoch || observation.observerId || ''),
     observationRevision: Number.isInteger(observationRevision) ? observationRevision : 0,
     transport: envelope ? {
@@ -247,8 +304,10 @@ export function tabObservationToCanonicalEvent(
     failedUserTurnKey: observationAppliesToRequest ? String(observation.error?.userTurnKey || '') : '',
     conversationChanged,
     conversationCanonicalized,
-    previousConversationId: conversationCanonicalized ? expectedConversationId : '',
+    conversationCanonicalizationDeferred,
+    previousConversationId: conversationCanonicalized && !conversationCanonicalizationDeferred ? expectedConversationId : '',
     requestReplaced,
+    observedRequestTerminal,
     scopedToRequest: responseAppliesToRequest,
     leaseScopedToRequest: observationAppliesToRequest,
     responseBoundaryEstablished,

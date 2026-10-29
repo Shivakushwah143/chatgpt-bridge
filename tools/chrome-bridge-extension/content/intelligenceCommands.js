@@ -592,6 +592,7 @@ async function readIntelligenceState({ includeModels = true } = {}) {
   diagnostic('intelligence.state.read.started', { includeModels });
   const beforeActive = document.activeElement;
   let pickerContent = await openIntelligencePicker();
+  if (pickerContent) noteIntelligencePickerOpen(includeModels ? 'model' : 'effort');
   if (!pickerContent) throw new Error('DOM_SCHEMA_CHANGED: intelligence picker content was not found.');
 
   try {
@@ -663,11 +664,40 @@ async function readIntelligenceState({ includeModels = true } = {}) {
   }
 }
 
+/**
+ * Condition-based wait: the click is only done when the selection is proven by
+ * stable DOM state, either the option itself or the composer trigger. A fixed
+ * sleep is used only as an upper bound, never as the success signal.
+ */
+async function waitForSelectionEvidence({ match, label, kind, timeoutMs = 1_500 } = {}) {
+  const started = Date.now();
+  const desired = normalizeComparable(label);
+  while (Date.now() - started < timeoutMs) {
+    const attributes = ['aria-checked', 'aria-selected', 'data-state', 'data-active'];
+    const optionSelected = attributes.some((name) => {
+      const value = match?.element?.getAttribute?.(name);
+      return value === 'true' || value === 'checked' || value === 'on';
+    });
+    if (optionSelected) return true;
+    const trigger = readIntelligenceTrigger();
+    if (trigger) {
+      const evidence = kind === 'effort'
+        ? knownEffortId(label) && trigger.effortId === knownEffortId(label)
+        : desired && normalizeComparable(trigger.modelLabel).includes(desired);
+      if (evidence) return true;
+    }
+    await delay(60);
+  }
+  return false;
+}
+
 async function trySelectIntelligenceOption(label, kind, request) {
   const desired = normalizeComparable(label);
   if (!desired) return { matched: false, clicked: false, alreadySelected: false };
   diagnostic(`${kind}.selection.started`, { requestId: request?.requestId, kind, label });
+  const selectionStarted = Date.now();
   let pickerContent = await openIntelligencePicker();
+  if (pickerContent) noteIntelligencePickerOpen(kind);
   if (!pickerContent) {
     diagnostic(`${kind}.picker_not_found`, { requestId: request?.requestId, label });
     return { matched: false, clicked: false, alreadySelected: false };
@@ -730,7 +760,9 @@ async function trySelectIntelligenceOption(label, kind, request) {
     const sliderSurface = kind === 'effort' ? effortSliderSurface(pickerContent) : null;
     if (sliderSurface) await selectEffortSliderOption(sliderSurface, match);
     else match.element.click();
-    await delay(INTELLIGENCE_UI_TIMING.selectionSettleMs);
+    const selectionProven = await waitForSelectionEvidence({ match, label, kind });
+    if (!selectionProven) await delay(INTELLIGENCE_UI_TIMING.selectionSettleMs);
+    noteIntelligenceSelection(Date.now() - selectionStarted);
     diagnostic(`${kind}.selection.clicked`, {
       requestId: request?.requestId,
       kind,
@@ -739,12 +771,257 @@ async function trySelectIntelligenceOption(label, kind, request) {
       matchedLabel: match.label,
       settleMs: INTELLIGENCE_UI_TIMING.selectionSettleMs,
     });
-    return { matched: true, clicked: true, alreadySelected: false, option: match };
+    return { matched: true, clicked: true, alreadySelected: false, proven: selectionProven, option: match };
   } finally {
     await closeIntelligenceMenus(beforeActive);
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Cached, idempotent intelligence state.
+//
+// The picker is expensive: reading it opens a menu, and every model/effort
+// change waits for a Radix transition. A turn that already has the desired
+// model and effort must therefore do no menu work at all. The composer trigger
+// exposes the current selection as stable DOM text, so a cheap observation is
+// the primary source of truth and the menu is only opened when it must change.
+// ---------------------------------------------------------------------------
+const INTELLIGENCE_CACHE_TTL_MS = 15 * 60_000;
+let intelligenceCache = null;
+let intelligenceTurnMetrics = null;
+const intelligenceTotals = {
+  turns: 0,
+  skippedTurns: 0,
+  detectReads: 0,
+  pickerOpens: 0,
+  modelMenuOpens: 0,
+  effortMenuOpens: 0,
+  selections: 0,
+  detectMs: 0,
+  selectMs: 0,
+};
+
+function emptyIntelligenceTurnMetrics() {
+  return {
+    modelMenuOpens: 0,
+    effortMenuOpens: 0,
+    pickerOpens: 0,
+    selections: 0,
+    detectMs: 0,
+    selectMs: 0,
+    skipped: false,
+    source: '',
+  };
+}
+
+function beginIntelligenceTurn() {
+  intelligenceTurnMetrics = emptyIntelligenceTurnMetrics();
+  intelligenceTotals.turns += 1;
+  return intelligenceTurnMetrics;
+}
+
+function currentIntelligenceTurnMetrics() {
+  return { ...(intelligenceTurnMetrics || emptyIntelligenceTurnMetrics()) };
+}
+
+function intelligenceMetricsSnapshot() {
+  return { turn: currentIntelligenceTurnMetrics(), totals: { ...intelligenceTotals } };
+}
+
+/**
+ * One per-turn cost report, sent as a diagnostic so the bridge can expose it
+ * without adding a protocol message. `submissionMs` is measured by the caller
+ * around the submit step; everything else is the turn's UI interaction cost.
+ */
+function reportIntelligenceMetrics({ requestId = '', submissionMs = 0, step = '' } = {}) {
+  const metrics = {
+    ...intelligenceMetricsSnapshot(),
+    submissionMs: Math.max(0, Number(submissionMs) || 0),
+    submissionStep: String(step || ''),
+    conversationKey: intelligenceConversationKey(),
+    cache: intelligenceCache ? {
+      ageMs: Math.max(0, Date.now() - Number(intelligenceCache.confirmedAt || 0)),
+      source: String(intelligenceCache.source || ''),
+      signature: String(intelligenceCache.signature || ''),
+    } : null,
+  };
+  diagnostic('intelligence.metrics', metrics);
+  send({ type: 'diagnostic', name: 'intelligence.metrics', requestId: String(requestId || ''), metrics });
+  return metrics;
+}
+
+function noteIntelligencePickerOpen(kind = 'picker') {
+  const turn = intelligenceTurnMetrics || beginIntelligenceTurn();
+  turn.pickerOpens += 1;
+  if (kind === 'model') turn.modelMenuOpens += 1;
+  if (kind === 'effort') turn.effortMenuOpens += 1;
+  intelligenceTotals.pickerOpens += 1;
+  if (kind === 'model') intelligenceTotals.modelMenuOpens += 1;
+  if (kind === 'effort') intelligenceTotals.effortMenuOpens += 1;
+}
+
+function noteIntelligenceSelection(elapsedMs = 0) {
+  const turn = intelligenceTurnMetrics || beginIntelligenceTurn();
+  turn.selections += 1;
+  turn.selectMs += Math.max(0, Number(elapsedMs) || 0);
+  intelligenceTotals.selections += 1;
+  intelligenceTotals.selectMs += Math.max(0, Number(elapsedMs) || 0);
+}
+
+/** Conversation identity. A new chat always invalidates every cached choice. */
+function intelligenceConversationKey() {
+  try {
+    return String(location.pathname || '/');
+  } catch {
+    return '/';
+  }
+}
+
+/**
+ * One composer-trigger observation: no menus, no clicks, no waiting.
+ *
+ * The composer toolbar exposes the model and the thinking effort as siblings,
+ * so both values are read from the same candidate scan: the model chip carries
+ * the model label, the effort chip carries the live effort.
+ */
+function readIntelligenceTrigger() {
+  const candidates = intelligencePickerTriggerCandidates()
+    .filter((entry) => entry.score >= 35)
+    .map((entry) => {
+      const descriptor = intelligenceOptionFromElement(entry.element);
+      const text = String(descriptor.rawText || descriptor.label || '');
+      return {
+        entry,
+        descriptor,
+        text,
+        effortId: knownEffortId(text) || knownEffortId(descriptor.label) || '',
+        modelish: /gpt|chatgpt|claude|gemini|model|модель|\bo\d\b/i.test(text),
+      };
+    });
+  if (!candidates.length) return null;
+  const modelEntry = candidates.find((entry) => entry.modelish && !entry.effortId)
+    || candidates.find((entry) => entry.modelish)
+    || candidates[0];
+  const descriptor = modelEntry.descriptor;
+  const effortEntry = candidates.find((entry) => entry.effortId);
+  return {
+    modelLabel: String(descriptor.label || '').trim(),
+    effortId: effortEntry?.effortId || '',
+    rawText: String(descriptor.rawText || descriptor.label || ''),
+    signature: normalizeComparable([descriptor.rawText || descriptor.label || '', effortEntry?.effortId || ''].filter(Boolean).join('|')),
+    source: 'composer-trigger',
+  };
+}
+
+/**
+ * A menuitem click inside the picker is the user changing the setting by hand.
+ * That is direct DOM evidence, so the cache is dropped the moment it happens
+ * instead of being re-verified on a timer.
+ */
+let intelligenceObserverInstalled = false;
+function installIntelligenceObservers() {
+  if (intelligenceObserverInstalled) return;
+  if (typeof document === 'undefined' || typeof document.addEventListener !== 'function') return;
+  intelligenceObserverInstalled = true;
+  document.addEventListener('click', (event) => {
+    const option = event?.target?.closest?.('[role="menuitemradio"], [role="menuitem"]');
+    if (!option?.closest?.('[role="menu"], [data-testid="composer-intelligence-picker-content"]')) return;
+    resetIntelligenceCache('user-selection');
+  }, true);
+}
+
+function resetIntelligenceCache(reason = 'explicit') {
+  const had = Boolean(intelligenceCache);
+  intelligenceCache = null;
+  diagnostic('intelligence.cache.reset', { reason, had });
+  return had;
+}
+
+/**
+ * Cheap current state. Returns confirmed cache when the conversation and the
+ * composer trigger still agree; otherwise a trigger-only observation. A trigger
+ * signature that changed since confirmation means the user changed the setting,
+ * so the cache is dropped instead of being trusted.
+ */
+function readCachedIntelligence() {
+  const started = Date.now();
+  const key = intelligenceConversationKey();
+  const trigger = readIntelligenceTrigger();
+  const turn = intelligenceTurnMetrics || beginIntelligenceTurn();
+  turn.detectMs += Date.now() - started;
+  intelligenceTotals.detectReads += 1;
+  intelligenceTotals.detectMs += Date.now() - started;
+  if (trigger) turn.source = trigger.source;
+
+  if (intelligenceCache) {
+    if (intelligenceCache.key !== key) {
+      resetIntelligenceCache('conversation-changed');
+    } else if (trigger?.signature && intelligenceCache.signature && trigger.signature !== intelligenceCache.signature) {
+      resetIntelligenceCache('trigger-signature-changed');
+    } else if (Date.now() - Number(intelligenceCache.confirmedAt || 0) >= INTELLIGENCE_CACHE_TTL_MS) {
+      resetIntelligenceCache('cache-expired');
+    }
+  }
+
+  if (intelligenceCache) {
+    return {
+      key,
+      modelLabel: intelligenceCache.modelLabel || '',
+      effortId: intelligenceCache.effortId || '',
+      signature: intelligenceCache.signature || trigger?.signature || '',
+      confirmed: true,
+      source: 'cache',
+      trigger,
+    };
+  }
+  return {
+    key,
+    modelLabel: trigger?.modelLabel || '',
+    effortId: trigger?.effortId || '',
+    signature: trigger?.signature || '',
+    confirmed: false,
+    source: trigger ? 'trigger' : 'unknown',
+    trigger,
+  };
+}
+
+function recordIntelligenceConfirmation({ modelLabel = '', effortId = '', signature = '', source = 'selection' } = {}) {
+  const trigger = signature ? null : readIntelligenceTrigger();
+  intelligenceCache = {
+    key: intelligenceConversationKey(),
+    modelLabel: String(modelLabel || trigger?.modelLabel || ''),
+    effortId: String(effortId || trigger?.effortId || ''),
+    signature: String(signature || trigger?.signature || ''),
+    confirmedAt: Date.now(),
+    source,
+  };
+  return intelligenceCache;
+}
+
+function intelligenceOptionFor(value = '') {
+  const text = String(value || '');
+  return { id: text, label: text, value: text };
+}
+
+/** Pure decision: which dimension actually needs a change? */
+function planIntelligenceAdjustment({ model = '', effort = '', current = {} } = {}) {
+  const desiredModel = String(model || '').trim();
+  const desiredEffort = String(effort || '').trim();
+  const modelKnown = Boolean(current?.modelLabel) || Boolean(current?.confirmed);
+  const effortKnown = Boolean(current?.effortId) || Boolean(current?.confirmed);
+  const modelNeeded = Boolean(desiredModel)
+    && (!modelKnown || !DOM_PARSER.intelligenceOptionMatches(intelligenceOptionFor(current?.modelLabel), desiredModel));
+  const effortNeeded = Boolean(desiredEffort)
+    && (!effortKnown || !DOM_PARSER.intelligenceOptionMatches(intelligenceOptionFor(current?.effortId), desiredEffort));
+  return {
+    model: modelNeeded,
+    effort: effortNeeded,
+    reason: !modelNeeded && !effortNeeded
+      ? 'already-current'
+      : modelNeeded && effortNeeded ? 'model-and-effort-mismatch' : modelNeeded ? 'model-mismatch' : 'effort-mismatch',
+  };
+}
 
 async function handleModelsList(payload) {
   try {
@@ -767,8 +1044,21 @@ async function handleEffortsList(payload) {
 
 
 
+    installIntelligenceObservers();
     return Object.freeze({
       INTELLIGENCE_UI_TIMING,
+      beginIntelligenceTurn,
+      currentIntelligenceTurnMetrics,
+      intelligenceMetricsSnapshot,
+      noteIntelligencePickerOpen,
+      noteIntelligenceSelection,
+      installIntelligenceObservers,
+      readCachedIntelligence,
+      readIntelligenceTrigger,
+      recordIntelligenceConfirmation,
+      reportIntelligenceMetrics,
+      resetIntelligenceCache,
+      planIntelligenceAdjustment,
       readIntelligenceState,
       trySelectIntelligenceOption,
       handleModelsList,

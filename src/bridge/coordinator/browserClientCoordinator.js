@@ -17,13 +17,14 @@ import { isRequestRuntimeFinished } from './requestRuntimeProjection.js';
  * request-visible decisions are emitted through the injected lifecycle.
  */
 export class BrowserClientCoordinator {
-  constructor({ hub, pending, lifecycle, runtimeOptions, sendCommand, releaseCoordinator = null }) {
+  constructor({ hub, pending, lifecycle, runtimeOptions, sendCommand, releaseCoordinator = null, staleLeases = null }) {
     this.hub = hub;
     this.pending = pending;
     this.lifecycle = lifecycle;
     this.runtimeOptions = runtimeOptions;
     this.sendCommand = sendCommand;
     this.releaseCoordinator = releaseCoordinator;
+    this.staleLeases = staleLeases;
     this.tabs = new BrowserTabCoordinator({
       hub,
       runtimeOptions,
@@ -68,6 +69,93 @@ isPromptClientIdle(client = {}, excludeRequestId = '') {
   if (this.releaseCoordinator?.isReleasePending?.(client.id)) return false;
   if (this.pendingUsesClient(client.id, excludeRequestId)) return false;
   return true;
+}
+
+// A tab opened by the bridge for agent API traffic carries a launch token of
+// this form, so it is never confused with a user's own ChatGPT tab.
+static AGENT_TAB_LAUNCH_TOKEN_RE = /^bridge-agent-/i;
+
+isAgentTab(client = {}) {
+  return BrowserClientCoordinator.AGENT_TAB_LAUNCH_TOKEN_RE.test(String(client.launchToken || ''));
+}
+
+// Closes only tabs this bridge opened for agent work. A user's own ChatGPT tab
+// never carries an agent launch token, so it can never be cleaned up here.
+async closeStaleAgentTabs(staleClients = [], sourceClientId = '') {
+  let closed = 0;
+  for (const client of staleClients) {
+    try {
+      await this.closeBrowserTab({
+        sourceClientId,
+        expectedLaunchToken: String(client.launchToken || ''),
+        expectedUrl: String(client.url || ''),
+      });
+      closed += 1;
+    } catch {
+      try {
+        this.hub.dropClient?.(client.id, 'stale_agent_tab');
+        closed += 1;
+      } catch {}
+    }
+  }
+  return closed;
+}
+
+async resolveDedicatedAgentClient(state, chatOptions = {}, options = {}) {
+  const desiredSessionId = normalizeConversationId(chatOptions.sessionId || '');
+  const agentTabs = Array.from(this.hub.clients || []).filter((client) => client?.ready
+    && client.compatible !== false
+    && client.compatibility?.compatible !== false
+    && this.isAgentTab(client));
+  const idleAgentTabs = agentTabs.filter((client) => this.isPromptClientIdle(client, state.requestId));
+  const target = desiredSessionId
+    ? idleAgentTabs.find((client) => clientMatchesSession(client, desiredSessionId)) || null
+    : idleAgentTabs[0] || null;
+  // Previous runs can leave idle Kodevra tabs behind. Keep the tab this run is
+  // bound to and close the rest; busy tabs may belong to a concurrent run and
+  // are left alone.
+  const staleAgentTabs = idleAgentTabs.filter((client) => client.id !== target?.id);
+  if (staleAgentTabs.length) {
+    const sourceClientId = target?.id
+      || this.browserControlClients().find((client) => !staleAgentTabs.some((stale) => stale.id === client.id))?.id
+      || '';
+    const closed = sourceClientId ? await this.closeStaleAgentTabs(staleAgentTabs, sourceClientId) : 0;
+    if (closed) {
+      this.lifecycle.emitRequestEvent(state, makeEvent('client.stale_agent_tabs.cleaned', {
+        requestId: state.requestId,
+        count: closed,
+        keptClientId: target?.id || '',
+      }));
+    }
+  }
+  if (target) {
+    this.hub.selectClient?.(target.id);
+    return this.#reservePromptTarget(state, { client: target, reason: 'dedicated_agent_tab', sessionSwitch: false });
+  }
+
+  const launchToken = `bridge-agent-${makeRequestId()}`;
+  const opened = await this.openBrowserTab({
+    url: this.promptTargetUrl(chatOptions),
+    active: false,
+    launchToken,
+    timeoutMs: Math.max(5_000, Number(options.autoOpenTabTimeoutMs) || this.runtimeOptions.autoOpenTabTimeoutMs || 30_000),
+    bootstrapWaitMs: Number(options.autoOpenTabBootstrapWaitMs ?? this.runtimeOptions.autoOpenTabBootstrapWaitMs) || 0,
+    allowSystemFallback: true,
+  });
+  const client = opened?.client;
+  if (!client?.id || !client.ready) {
+    throw new Error('Bridge opened a dedicated ChatGPT tab, but no ready extension client connected to it.');
+  }
+  if (!this.isPromptClientIdle(client, state.requestId)) {
+    throw new Error(`Dedicated ChatGPT tab ${client.id} is not idle.`);
+  }
+  this.hub.selectClient?.(client.id);
+  this.lifecycle.emitRequestEvent(state, makeEvent('client.dedicated_tab.opened', {
+    requestId: state.requestId,
+    clientId: client.id,
+    launchToken,
+  }));
+  return this.#reservePromptTarget(state, { client, reason: 'dedicated_agent_tab_opened', sessionSwitch: false });
 }
 
 rankPromptClients(clients = []) {
@@ -201,6 +289,20 @@ async resolvePromptClient(state, chatOptions = {}, options = {}) {
   const desiredSessionId = !chatOptions.newSession ? normalizeConversationId(chatOptions.sessionId || '') : '';
   const autoOpenEnabled = this.autoOpenPromptEnabled(chatOptions, options);
 
+  // A tab reconnected to this bridge generation can still advertise a lease
+  // owned by a dead previous instance. Reconcile it here, before selection can
+  // fail, so the first request never races background reconnect work.
+  if (this.staleLeases && !options.staleLeaseReconciled) {
+    const released = await this.staleLeases.reconcileClients(clients);
+    if (released > 0) {
+      this.lifecycle.emitRequestEvent(state, makeEvent('client.stale_lease.reconciled', {
+        requestId: state.requestId,
+        count: released,
+      }));
+      return await this.resolvePromptClient(state, chatOptions, { ...options, staleLeaseReconciled: true });
+    }
+  }
+
   const releasePendingClients = clients.filter((client) => this.releaseCoordinator?.isReleasePending?.(client.id));
   if (!idleClients.length && releasePendingClients.length === 1 && !options.releaseBarrierWaited) {
     const client = releasePendingClients[0];
@@ -222,6 +324,11 @@ async resolvePromptClient(state, chatOptions = {}, options = {}) {
     if (!this.isPromptClientIdle(client, state.requestId)) throw new Error(`Browser extension client ${explicitClientId} is busy with ${client.activeRequest?.requestId || 'another local request'}.`);
     return this.#reservePromptTarget(state, { client, reason: 'explicit_client', sessionSwitch: Boolean(desiredSessionId && !clientMatchesSession(client, desiredSessionId)) });
   }
+
+  // Agent API traffic (Kodevra and other OpenAI-compatible clients) never runs
+  // in a user's own ChatGPT tab. It reuses the dedicated agent tab when that tab
+  // is already bound, and otherwise opens one.
+  if (chatOptions.dedicatedTab) return await this.resolveDedicatedAgentClient(state, chatOptions, options);
 
   if (desiredSessionId) {
     const exactIdle = this.rankPromptClients(idleClients.filter((client) => clientMatchesSession(client, desiredSessionId)));

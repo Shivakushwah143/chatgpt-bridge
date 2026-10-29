@@ -12,6 +12,10 @@ export function effectSlot(state, domain) {
 export function withEffectSlot(state, domain, patch) {
   const current = effectSlot(state, domain);
   const nextSlot = { ...current, ...patch };
+  // A settled slot has no active effect, so it also has no identity to quote.
+  if (Object.hasOwn(patch || {}, 'activeId') && patch.activeId === null && !Object.hasOwn(patch, 'activeIdentity')) {
+    nextSlot.activeIdentity = null;
+  }
   return {
     ...state,
     effect: {

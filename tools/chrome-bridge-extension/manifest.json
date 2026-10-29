@@ -52,6 +52,7 @@
         "content/transportRuntime.js",
         "content/panelRuntime.js",
         "content/pageStatusRuntime.js",
+        "content/responseStreamRuntime.js",
         "content/requestTelemetry.js",
         "content/layoutCapture.js",
         "shared/commandManifest.js",

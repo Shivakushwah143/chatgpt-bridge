@@ -18,6 +18,8 @@ class FakeHub extends EventEmitter {
     this.serverInstanceId = 'server-test';
     this.deliveryError = null;
     this.releaseResponse = 'success';
+    this.releaseDelayMs = 0;
+    this.releaseAcked = false;
   }
 
   get clients() { return Array.from(this.readyClients.values()); }
@@ -26,6 +28,7 @@ class FakeHub extends EventEmitter {
 
   sendToActiveWithDelivery(payload) {
     this.sent.push({ clientId: this.activeClient.id, payload });
+    this.ackRelease(this.activeClient.id, payload);
     return {
       client: this.activeClient,
       delivered: this.deliveryError ? Promise.reject(this.deliveryError) : Promise.resolve(),
@@ -34,6 +37,7 @@ class FakeHub extends EventEmitter {
 
   sendToClientWithDelivery(clientId, payload) {
     this.sent.push({ clientId, payload });
+    this.ackRelease(clientId, payload);
     return {
       client: this.readyClients.get(clientId) || { id: clientId, ready: true },
       delivered: this.deliveryError
@@ -42,21 +46,30 @@ class FakeHub extends EventEmitter {
     };
   }
 
+  ackRelease(clientId, payload) {
+    if (payload.type === 'request.release' && payload.commandId) {
+      const emitRelease = () => {
+        this.releaseAcked = true;
+        if (this.releaseResponse === 'success') {
+          this.emit('client.message', {
+            clientId,
+            payload: { type: 'lease.released', commandId: payload.commandId, requestId: payload.requestId, released: true, activeRequest: null },
+          });
+        } else if (this.releaseResponse === 'error') {
+          this.emit('client.message', {
+            clientId,
+            payload: { type: 'lease.quarantined', commandId: payload.commandId, requestId: payload.requestId, code: 'RELEASE_FAILED', message: 'Release failed after terminal publication' },
+          });
+        }
+      };
+      if (this.releaseDelayMs > 0) setTimeout(emitRelease, this.releaseDelayMs);
+      else queueMicrotask(emitRelease);
+    }
+  }
+
   sendToClient(clientId, payload) {
     this.sent.push({ clientId, payload });
-    if (payload.type === 'request.release' && payload.commandId) {
-      if (this.releaseResponse === 'success') {
-        queueMicrotask(() => this.emit('client.message', {
-          clientId,
-          payload: { type: 'command.result', commandId: payload.commandId, requestId: payload.requestId, released: true },
-        }));
-      } else if (this.releaseResponse === 'error') {
-        queueMicrotask(() => this.emit('client.message', {
-          clientId,
-          payload: { type: 'command.error', commandId: payload.commandId, requestId: payload.requestId, code: 'RELEASE_FAILED', message: 'Release failed after terminal publication' },
-        }));
-      }
-    }
+    this.ackRelease(clientId, payload);
     return this.readyClients.get(clientId) || { id: clientId, ready: true };
   }
 }
@@ -249,11 +262,14 @@ test('stable Protocol 5 observations are finalized by the server before the tab 
   assert.equal(bridge.requestDiagnostics().some((item) => item.requestId === prompt.requestId), false);
 });
 
-test('terminal completion resolves without waiting for request.release acknowledgement', async () => {
+test('terminal completion waits for request.release before settling the request', async () => {
+  // Ownership is part of the request result contract: a request is not settled
+  // while the tab it owns is still leased to it. The result is materialized
+  // before the release is dispatched, so cleanup can never lose the answer.
   const hub = new FakeHub();
-  hub.releaseResponse = 'none';
+  hub.releaseDelayMs = 100;
   const bridge = new BrowserBridge(hub);
-  const requestPromise = bridge.sendRequest({ message: 'release must not block completion' });
+  const requestPromise = bridge.sendRequest({ message: 'release is part of completion' });
   await nextTick();
 
   const prompt = hub.sent.find((entry) => entry.payload.type === 'prompt.send')?.payload;
@@ -266,11 +282,14 @@ test('terminal completion resolves without waiting for request.release acknowled
     answer: 'published first',
   });
 
-  const response = await Promise.race([
-    requestPromise,
-    new Promise((_, reject) => setTimeout(() => reject(new Error('terminal result waited for request.release')), 250)),
-  ]);
+  let settled = false;
+  const tracked = requestPromise.then((value) => { settled = true; return value; });
+  await new Promise((resolve) => setTimeout(resolve, 25));
+  assert.equal(settled, false, 'the response must not settle while the tab is still leased to the request');
+
+  const response = await tracked;
   assert.equal(response.answer, 'published first');
+  assert.equal(hub.releaseAcked, true, 'the release must be acknowledged before the request settles');
   assert.ok(hub.sent.some((entry) => entry.payload.type === 'request.release' && entry.payload.requestId === prompt.requestId));
   await bridge.close({ cancelPending: false });
 });

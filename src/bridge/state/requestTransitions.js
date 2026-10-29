@@ -156,6 +156,9 @@ export function applyObservation(state, event) {
       response: {
         ...next.response,
         userTurnKey: String(data.submittedUserTurnKey),
+        // Page evidence proved the submitted turn again; any pending
+        // post-reload boundary recovery is over.
+        boundaryRecovery: null,
       },
     };
   }
@@ -168,6 +171,16 @@ export function applyObservation(state, event) {
         previousConversationId: String(data.previousConversationId || ''),
         conversationId: String(data.conversationId || ''),
         submittedUserTurnKey: String(data.submittedUserTurnKey || ''),
+      },
+    });
+  }
+  if (data.conversationCanonicalizationDeferred === true) {
+    diagnostics.push({
+      code: 'conversation_canonicalization_deferred',
+      message: `Deferred ChatGPT conversation change ${String(next.source?.conversationId || '')} -> ${String(data.observation?.conversationId || '')} until the submitted user turn is observable`,
+      data: {
+        boundConversationId: String(next.source?.conversationId || ''),
+        observedConversationId: String(data.observation?.conversationId || ''),
       },
     });
   }

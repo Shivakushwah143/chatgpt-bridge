@@ -161,6 +161,11 @@ export const config = Object.freeze({
   forcedSnapshotAfterMs: intFromEnv('FORCED_SNAPSHOT_AFTER_MS', 90_000),
   forcedSnapshotCooldownMs: intFromEnv('FORCED_SNAPSHOT_COOLDOWN_MS', 60_000),
   forcedSnapshotTimeoutMs: intFromEnv('FORCED_SNAPSHOT_TIMEOUT_MS', 30_000),
+  // A content reload can take longer than one DOM read to repaint a multi-turn
+  // conversation. Canonical boundary recovery keeps retrying within this window
+  // before it may fail closed.
+  requestBoundaryRecoveryMs: intFromEnv('REQUEST_BOUNDARY_RECOVERY_MS', 30_000),
+  requestBoundaryRecoveryRetryMs: intFromEnv('REQUEST_BOUNDARY_RECOVERY_RETRY_MS', 1_500),
   answerSettleMs: intFromEnv('ANSWER_SETTLE_MS', 1500),
   answerDoneSettleMs: intFromEnv('ANSWER_DONE_SETTLE_MS', 600),
   postStopTerminalSettleMs: intFromEnv('POST_STOP_TERMINAL_SETTLE_MS', 900),

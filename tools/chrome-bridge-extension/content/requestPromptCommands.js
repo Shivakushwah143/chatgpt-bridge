@@ -23,6 +23,7 @@
       markRequestProgress,
       refreshRequestTurnAnchors,
       registerPassivePromptBoundary,
+      reportIntelligenceMetrics,
       releaseRequest,
       settleReleaseCleanup,
       runObservedRequestEffect,
@@ -237,6 +238,10 @@
           baselineCount: submissionBaseline.size,
         });
 
+        // Prompt submission latency is measured here, around the step that
+        // actually types and sends, so it can be reported with the turn's UI
+        // interaction cost.
+        const submissionStartedAt = Date.now();
         await runObservedRequestEffect(request, currentStepKind, async () => {
           await enterPrompt(message, request, { kind: 'prompt' });
           request.update('request.anchor_updated', { sentAt: Date.now() });
@@ -256,6 +261,7 @@
         diagnostic('prompt.sent', { requestId });
         emitChatEvent(request, 'prompt.sent', { attachmentCount: attachments.length });
         collectAndEmit(request);
+        reportIntelligenceMetrics?.({ requestId, step: currentStepKind, submissionMs: Date.now() - submissionStartedAt });
 
       } catch (err) {
         if (!err?.bridgeEffectReported) {
@@ -335,6 +341,11 @@
           title: document.title,
         });
         submissionReported = true;
+        reportIntelligenceMetrics?.({
+          requestId: request.requestId,
+          step: 'passive.prompt.submit',
+          submissionMs: Date.now() - Number(request.promptSubmissionStartedAt || Date.now()),
+        });
         // Observation bookkeeping cannot turn a confirmed submission into failure.
         registerPassivePromptBoundary(request, baseline);
         diagnostic('passive.prompt.submit.completed', { commandId, submittedUserTurnKey: request.submittedUserTurnKey || '' });

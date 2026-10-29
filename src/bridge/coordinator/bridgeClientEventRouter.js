@@ -46,6 +46,9 @@ export class BridgeClientEventRouter {
     registerObservedArtifacts,
     handleCommandResponse,
     sendCommand = null,
+    recordIntelligenceMetrics = null,
+    liveDelta = null,
+    resolveClient = null,
   }) {
     this.pending = pending;
     this.commands = commands;
@@ -56,6 +59,9 @@ export class BridgeClientEventRouter {
     this.registerObservedArtifacts = registerObservedArtifacts;
     this.handleCommandResponse = handleCommandResponse;
     this.sendCommand = sendCommand;
+    this.recordIntelligenceMetrics = recordIntelligenceMetrics;
+    this.resolveClient = typeof resolveClient === 'function' ? resolveClient : null;
+    this.liveDelta = typeof liveDelta === 'function' ? liveDelta : null;
     this.results = new RequestResultAccumulator();
     this.passive = new PassiveObservationRouter({
       eventBus,
@@ -102,6 +108,15 @@ handleClientMessage(clientId, payload, envelope = null) {
   if (payload.type === 'diagnostic') {
     const diagnosticRequestId = String(payload.requestId || '');
     const diagnosticName = String(payload.name || 'diagnostic');
+    if (diagnosticName === 'intelligence.metrics') {
+      this.recordIntelligenceMetrics?.(clientId, {
+        ...(payload.metrics && typeof payload.metrics === 'object' ? payload.metrics : {}),
+        clientId,
+        observedAt: new Date().toISOString(),
+      });
+      this.eventBus?.emitDebug({ type: 'intelligence.metrics', requestId: diagnosticRequestId, clientId, data: payload.metrics || {} });
+      return;
+    }
     const diagnosticState = diagnosticRequestId ? this.pending.get(diagnosticRequestId) : null;
     if (diagnosticState && (!diagnosticState.clientId || diagnosticState.clientId === clientId)) {
       const diagnosticEvent = makeEvent(`diagnostic.${diagnosticName}`, {
@@ -120,15 +135,54 @@ handleClientMessage(clientId, payload, envelope = null) {
     return;
   }
 
+  // Model/effort selection cost is reported by the tab itself: the client
+  // knows how many menus it opened and how much time it spent. It is not part
+  // of a request lifecycle, so it is recorded per client instead.
+  if (payload.type === 'intelligence.metrics') {
+    this.recordIntelligenceMetrics?.(clientId, {
+      ...(payload.metrics && typeof payload.metrics === 'object' ? payload.metrics : {}),
+      clientId,
+      observedAt: new Date().toISOString(),
+    });
+    return;
+  }
 
   const requestId = payload?.requestId;
   if (!requestId) return;
 
   const state = this.pending.get(requestId);
-  if (!state || (state.clientId && state.clientId !== clientId)) return;
+  if (!state) return;
+  if (state.clientId && state.clientId !== clientId) {
+    // A launched conversation tab can reconnect under a replaced connection
+    // while the request is still running. Its stable launch identity (or the
+    // lease it reports) is what transfers ownership; anything else is ignored.
+    const client = this.resolveClient?.(clientId) || null;
+    if (!client || !this.reattachment.claimOwnership(state, client, 'client_message')) return;
+  }
 
   if (payload.type === 'command.accepted') return;
   if (payload.type === 'command.result') return;
+  // Display-only text growth from the bound assistant turn. It rides the existing
+  // command channel but changes no request state: canonical completion and the
+  // final answer still come from tab observation, exactly as before.
+  // Display-only growth from the bound assistant turn. It is handed to the
+  // durable request's ephemeral channel and never enters the request event
+  // timeline: canonical completion and the final answer still come from tab
+  // observation, exactly as before.
+  if (payload.type === 'response.delta') {
+    const delta = String(payload.delta || '');
+    if (!delta || !this.liveDelta) return;
+    this.liveDelta(requestId, {
+      type: 'response.delta',
+      seq: Math.max(0, Number(payload.seq) || 0),
+      delta,
+      answerLength: Math.max(0, Number(payload.answerLength) || 0),
+      turnKey: String(payload.turnKey || ''),
+      sessionId: String(payload.sessionId || ''),
+      source: 'tab.stream',
+    });
+    return;
+  }
   if (payload.type === 'command.error' || payload.type === 'command.rejected') {
     this.lifecycle.ingestRequestTransition(state, this.lifecycle.canonicalEvent(state, RequestEventType.FAILED, {
       code: String(payload.code || 'BROWSER_COMMAND_REJECTED'),
@@ -151,6 +205,13 @@ handleClientMessage(clientId, payload, envelope = null) {
       effectId: payload.effectId || '',
       effectType,
       effectDomain: 'browser',
+      // Carry the browser's own effect identity verbatim. Reconciliation is
+      // dispatched later against the persisted lease, and the extension only
+      // accepts evidence that quotes the exact identity it recorded.
+      idempotencyKey: String(payload.idempotencyKey || ''),
+      preconditions: payload.preconditions && typeof payload.preconditions === 'object' ? payload.preconditions : {},
+      preconditionsHash: String(payload.preconditionsHash || ''),
+      attempt: Math.max(1, Number(payload.attempt) || 1),
       evidence: payload.evidence || null,
       phase: payload.phase || '',
     }, 'browser_effect'));
@@ -212,6 +273,7 @@ handleClientMessage(clientId, payload, envelope = null) {
         clientId,
         effectId: payload.effectId || '',
         submissionSource: 'browser_effect_result',
+        submittedUserTurnKey: String(result.submittedUserTurnKey || ''),
       }, 'browser_effect'));
       if (promptTransition?.accepted) {
         this.lifecycle.emitRequestEvent(state, makeEvent(retryAttempt > 0 ? 'request.retry.accepted' : 'prompt.sent', {
@@ -329,9 +391,17 @@ handleClientActivity(clientId, client = null, payload = {}, envelope = null) {
     : payload?.tabObservation && typeof payload.tabObservation === 'object'
       ? payload.tabObservation
       : null;
+  // Sequential turns reuse one dedicated tab, so a capture queued while the
+  // previous request was still current can arrive after the next request was
+  // accepted. That request is already proven terminal: its stale view must not
+  // replace (or invalidate) the request that now owns the tab.
+  const observedActiveRequestId = String(observation?.activeRequest?.requestId || '');
+  const observedRequestTerminal = Boolean(observedActiveRequestId)
+    && Boolean(this.lifecycle.getState(observedActiveRequestId)?.terminal);
   for (const state of this.pending.values()) {
     if (isRequestRuntimeFinished(state)) continue;
-    if (state.clientId && state.clientId !== clientId) continue;
+    if (state.clientId && state.clientId !== clientId
+      && !this.reattachment.claimOwnership(state, client || { id: clientId }, 'client_activity')) continue;
     const currentCanonical = this.lifecycle.getState(state.requestId);
     const tabObservationEvent = tabObservationToCanonicalEvent(
       state.requestId,
@@ -340,6 +410,7 @@ handleClientActivity(clientId, client = null, payload = {}, envelope = null) {
       currentCanonical,
       Date.now(),
       envelope,
+      { observedRequestTerminal },
     );
     if (tabObservationEvent) {
       const data = tabObservationEvent.data || {};

@@ -77,6 +77,7 @@ function makeHarness({
   });
 
   return {
+    sent,
     async reconcile(payload = {}) {
       await commands.handleEffectReconcile({
         commandId: 'command-1',
@@ -84,7 +85,7 @@ function makeHarness({
         effectId: 'effect-1',
         ...payload,
       });
-      return sent.at(-1);
+      return sent.findLast((message) => message.type === 'bridge.effect.reconcile_result');
     },
   };
 }
@@ -192,6 +193,18 @@ for (const scenario of cases) {
     assert.equal(result.reconciliationReason, scenario.reason);
   });
 }
+
+test('every reconciliation also emits the correlated result that terminates its command', async () => {
+  const harness = makeHarness({ page: { pageReady: true } });
+  await harness.reconcile({ effectType: 'page.ready.initial' });
+  const terminal = harness.sent.find((message) => message.type === 'request.effect.reconciled');
+  assert.ok(terminal, 'a dispatched reconcile command needs its own terminal result');
+  assert.equal(terminal.commandId, 'command-1');
+  assert.equal(terminal.requestId, 'request-1');
+  assert.equal(terminal.effectId, 'effect-1');
+  assert.equal(terminal.effectType, 'page.ready.initial');
+  assert.equal(terminal.reconciliationOutcome, 'succeeded');
+});
 
 test('effect reconciliation fails closed when the request projection is missing', async () => {
   const result = await makeHarness({ request: null }).reconcile({ effectType: 'prompt.submit' });
@@ -439,6 +452,113 @@ test('request.resume rebinds a changed DOM turn key only from exact submitted pr
   assert.equal(sent.at(-1).boundaryStatus, 'rebound');
   assert.equal(sent.at(-1).submittedUserTurnKey, 'user-new-key');
   assert.equal(request.assistantTurnKey, 'assistant-new-key');
+});
+
+function resumeContext() {
+  const context = { console, location: { href: 'https://chatgpt.com/c/session-1' }, document: { title: 'Session' }, Date };
+  context.globalThis = context;
+  vm.createContext(context);
+  for (const source of sources) vm.runInContext(source, context);
+  return context;
+}
+
+function resumeTurnFactory() {
+  return (turn) => turn.key;
+}
+
+test('request.resume rebinds a reloaded user turn from its collapsed prompt preview', async () => {
+  const context = resumeContext();
+  const sent = [];
+  const request = {
+    requestId: 'request-preview', submittedUserTurnKey: '', assistantTurnKey: '', responseEpoch: 0,
+    update(_type, patch) { Object.assign(this, patch); },
+  };
+  const prefix = 'Kodevra action 6: inspect the canonical request runtime and keep every turn sticky in the dedicated agent tab';
+  const expectedPrompt = `${prefix} before reporting the result to the operator.`;
+  const turns = [
+    {
+      key: 'user-reloaded',
+      promptText: `${prefix} …\nShow more`,
+      // The container also holds turn actions, which are not the prompt.
+      innerText: `${prefix} …\nShow more Copy Edit message`,
+      getAttribute: (name) => name === 'data-turn' ? 'user' : null,
+      querySelector: () => null,
+    },
+    { key: 'assistant-reloaded', textContent: 'resumed answer', getAttribute: (name) => name === 'data-turn' ? 'assistant' : null, querySelector: () => null },
+  ];
+  const commands = context.ChatGptRequestCommands.createRequestCommands({
+    REQUEST_STATE: { createRequestState: () => ({}), publicRequestStatus: () => ({ requestId: request.requestId }) },
+    DOM_PARSER: {}, getActiveRequest: () => request, getCurrentSession: () => ({ id: 'session-1' }),
+    getTurnNodes: () => turns, turnKey: resumeTurnFactory(), readUserTurnPromptText: (turn) => turn.promptText || '',
+    normalizeText: (value) => String(value || '').trim().replace(/\s+/g, ' '),
+    waitForChatPageReady: async () => {}, resumeBoundaryTimeoutMs: 0, findStopButton: () => null, isGenerating: () => false,
+    send: (message) => sent.push(structuredClone(message)), diagnostic: () => {}, startDomMonitor: () => {}, collectAndEmit: () => {},
+  });
+  await commands.handleRequestResume({
+    commandId: 'resume-preview', requestId: request.requestId,
+    projection: { responseEpoch: 1, submittedUserTurnKey: 'user-optimistic', submittedPromptText: expectedPrompt },
+  });
+  assert.equal(sent.at(-1).boundaryStatus, 'rebound');
+  assert.equal(sent.at(-1).submittedUserTurnKey, 'user-reloaded');
+  assert.equal(sent.at(-1).boundaryEvidence.truncatedPromptPrefix, true);
+});
+
+test('request.resume never rebinds to an older matching turn when a newer user turn is present', async () => {
+  const context = resumeContext();
+  const sent = [];
+  const request = {
+    requestId: 'request-older', submittedUserTurnKey: '', assistantTurnKey: '', responseEpoch: 0,
+    update(_type, patch) { Object.assign(this, patch); },
+  };
+  const turns = [
+    { key: 'user-older', textContent: 'same exact prompt', getAttribute: (name) => name === 'data-turn' ? 'user' : null, querySelector: () => null },
+    { key: 'user-newer', textContent: 'a different prompt typed later', getAttribute: (name) => name === 'data-turn' ? 'user' : null, querySelector: () => null },
+    { key: 'assistant-newer', textContent: 'answer', getAttribute: (name) => name === 'data-turn' ? 'assistant' : null, querySelector: () => null },
+  ];
+  const commands = context.ChatGptRequestCommands.createRequestCommands({
+    REQUEST_STATE: { createRequestState: () => ({}), publicRequestStatus: () => ({ requestId: request.requestId }) },
+    DOM_PARSER: {}, getActiveRequest: () => request, getCurrentSession: () => ({ id: 'session-1' }),
+    getTurnNodes: () => turns, turnKey: resumeTurnFactory(),
+    normalizeText: (value) => String(value || '').trim().replace(/\s+/g, ' '),
+    waitForChatPageReady: async () => {}, resumeBoundaryTimeoutMs: 0, findStopButton: () => null, isGenerating: () => false,
+    send: (message) => sent.push(structuredClone(message)), diagnostic: () => {}, startDomMonitor: () => {}, collectAndEmit: () => {},
+  });
+  await commands.handleRequestResume({
+    commandId: 'resume-older', requestId: request.requestId,
+    projection: { responseEpoch: 1, submittedUserTurnKey: 'user-stale', submittedPromptText: 'same exact prompt' },
+  });
+  assert.equal(sent.at(-1).boundaryStatus, 'missing');
+  assert.equal(sent.at(-1).submittedUserTurnKey, 'user-stale');
+});
+
+test('request.resume recovers the response from a canonical assistant turn when the user bubble is gone', async () => {
+  const context = resumeContext();
+  const sent = [];
+  const request = {
+    requestId: 'request-assistant-only', submittedUserTurnKey: '', assistantTurnKey: '', responseEpoch: 0,
+    update(_type, patch) { Object.assign(this, patch); },
+  };
+  const turns = [
+    { key: 'assistant-canonical', textContent: 'answer that outlived the reload', getAttribute: (name) => name === 'data-turn' ? 'assistant' : null, querySelector: () => null },
+  ];
+  const commands = context.ChatGptRequestCommands.createRequestCommands({
+    REQUEST_STATE: { createRequestState: () => ({}), publicRequestStatus: () => ({ requestId: request.requestId }) },
+    DOM_PARSER: {}, getActiveRequest: () => request, getCurrentSession: () => ({ id: 'session-1' }),
+    getTurnNodes: () => turns, turnKey: resumeTurnFactory(),
+    normalizeText: (value) => String(value || '').trim().replace(/\s+/g, ' '),
+    waitForChatPageReady: async () => {}, resumeBoundaryTimeoutMs: 0, findStopButton: () => null, isGenerating: () => false,
+    send: (message) => sent.push(structuredClone(message)), diagnostic: () => {}, startDomMonitor: () => {}, collectAndEmit: () => {},
+  });
+  await commands.handleRequestResume({
+    commandId: 'resume-assistant-only', requestId: request.requestId,
+    projection: {
+      responseEpoch: 1, submittedUserTurnKey: 'user-canonical', submittedUserTurnIndex: 0,
+      assistantTurnKey: 'assistant-canonical', submittedPromptText: 'prompt whose bubble is gone',
+    },
+  });
+  assert.equal(sent.at(-1).boundaryStatus, 'rebound');
+  assert.equal(sent.at(-1).submittedUserTurnKey, 'user-canonical');
+  assert.equal(sent.at(-1).assistantTurnKey, 'assistant-canonical');
 });
 
 test('request.resume reports a missing boundary instead of attaching an older assistant turn', async () => {

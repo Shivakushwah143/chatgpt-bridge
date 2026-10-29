@@ -9,7 +9,7 @@ import {
   createRequestEffectDescriptor,
 } from '../src/bridge/requestExecutionPlan.js';
 import { createExtensionEnvelope, ExtensionMessageType } from '../src/bridge/protocol/v5.js';
-import { BackgroundStateStore } from '../tools/chrome-bridge-extension/background/stateV6.js';
+import { BackgroundStateStore, pendingReleaseDeadlines } from '../tools/chrome-bridge-extension/background/stateV6.js';
 import { createProtocolOutbox } from '../tools/chrome-bridge-extension/background/outboxV5.js';
 import { handlePayload, handleReleaseCleanupSettlement } from '../tools/chrome-bridge-extension/background/portRouter.js';
 import { handleServerEnvelope } from '../tools/chrome-bridge-extension/background/serverEnvelopeRouter.js';
@@ -441,6 +441,188 @@ test('request.release recovers one exact stale lease once without replaying a pr
     assert.equal(h.sent.some((entry) => entry.messageType === ExtensionMessageType.COMMAND_REJECTED
       && entry.body.commandId === 'stale-release-command-repeat'), true);
   } finally { h.restore(); }
+});
+
+async function completeStaleRelease(h, request, commandId = 'stale-complete-release') {
+  await initializeHarness(h);
+  await quarantineLease(h, request);
+  await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+    sequence: 1, commandId, type: 'request.release', request, payload: { recoveryMode: 'stale_lease' },
+  }) });
+  const settled = await handleReleaseCleanupSettlement(h, h.state, {
+    commandId, requestId: request.requestId, status: 'completed', released: true,
+  });
+  return settled;
+}
+
+test('stale release clears the persisted lease and emits exactly one terminal lease.released', async () => {
+  const h = backgroundHarness(103);
+  const request = { requestId: 'request-stale-complete', leaseId: 'lease-stale-complete', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  try {
+    const settled = await completeStaleRelease(h, request);
+    assert.equal(settled.persisted, true);
+
+    const runtime = await h.backgroundState.read(h.state.tabId);
+    assert.equal(runtime.lease, null);
+    assert.equal(runtime.commands['stale-complete-release'].status, 'succeeded');
+    assert.equal(runtime.commands['stale-complete-release'].resultType, 'lease.released');
+    assert.equal(runtime.journal.filter((entry) => entry.type === 'lease.release_recover').length, 1);
+    const released = runtime.outbox.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED);
+    assert.equal(released.length, 1);
+    assert.equal(released[0].commandId, 'stale-complete-release');
+    assert.equal(released[0].body.released, true);
+    assert.equal(released[0].body.activeRequest, null);
+    assert.equal(h.sent.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED).length, 1);
+    assert.equal(h.posted.filter((entry) => entry.type === 'server.message' && entry.payload.type === 'request.release').length, 1);
+  } finally { h.restore(); }
+});
+
+test('duplicate delivery of a completed stale release replays its terminal result without a second dispatch', async () => {
+  const h = backgroundHarness(104);
+  const request = { requestId: 'request-stale-duplicate', leaseId: 'lease-stale-duplicate', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  try {
+    await completeStaleRelease(h, request, 'stale-duplicate-release');
+    const completed = await h.backgroundState.read(h.state.tabId);
+    const terminal = completed.outbox.find((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED);
+    assert.ok(terminal);
+    const acknowledged = await h.backgroundState.transition(h.state.tabId, {
+      type: 'outbox.acknowledged', messageId: terminal.messageId, sequence: 1, contentEpoch: h.state.contentEpoch,
+    });
+    assert.equal(acknowledged.accepted, true);
+    const sentBefore = h.sent.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED).length;
+
+    await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+      sequence: 2, commandId: 'stale-duplicate-release', type: 'request.release', request,
+      payload: { recoveryMode: 'stale_lease' },
+    }) });
+
+    const runtime = await h.backgroundState.read(h.state.tabId);
+    assert.equal(runtime.lease, null);
+    assert.equal(Object.values(runtime.commands).filter((command) => command.commandType === 'request.release').length, 1);
+    assert.equal(runtime.commands['stale-duplicate-release'].status, 'succeeded');
+    const replayed = runtime.outbox.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED);
+    assert.equal(replayed.length, 1);
+    assert.equal(replayed[0].body.commandId, 'stale-duplicate-release');
+    assert.equal(replayed[0].body.activeRequest, null);
+    assert.equal(h.sent.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED).length, sentBefore + 1);
+    assert.equal(h.posted.filter((entry) => entry.type === 'server.message' && entry.payload.type === 'request.release').length, 1);
+  } finally { h.restore(); }
+});
+
+test('a release redelivered for an already released lease returns that terminal result instead of a lease error', async () => {
+  const h = backgroundHarness(105);
+  const request = { requestId: 'request-stale-replay', leaseId: 'lease-stale-replay', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  try {
+    await completeStaleRelease(h, request, 'stale-replay-release');
+
+    await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+      sequence: 2, commandId: 'stale-replay-release-retry', type: 'request.release', request,
+      payload: { recoveryMode: 'stale_lease' },
+    }) });
+
+    const runtime = await h.backgroundState.read(h.state.tabId);
+    assert.equal(runtime.lease, null);
+    assert.equal(runtime.commands['stale-replay-release-retry'], undefined);
+    assert.equal(h.sent.some((entry) => entry.messageType === ExtensionMessageType.COMMAND_REJECTED
+      && entry.body.commandId === 'stale-replay-release-retry'), false);
+    const acknowledgements = h.sent.filter((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED
+      && entry.body.commandId === 'stale-replay-release-retry');
+    assert.equal(acknowledgements.length, 1);
+    assert.equal(acknowledgements[0].body.released, true);
+    assert.equal(acknowledgements[0].body.requestId, request.requestId);
+    assert.equal(acknowledgements[0].body.activeRequest, null);
+  } finally { h.restore(); }
+});
+
+test('a completed release acknowledgement never clears a newer lease on the same tab', async () => {
+  const h = backgroundHarness(108);
+  const released = { requestId: 'request-old-lease', leaseId: 'lease-old', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  const current = { requestId: 'request-new-lease', leaseId: 'lease-new', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  try {
+    await completeStaleRelease(h, released, 'old-lease-release');
+    const claimed = await h.backgroundState.transition(h.state.tabId, {
+      type: 'lease.claim', ...current, contentEpoch: h.state.contentEpoch,
+    });
+    assert.equal(claimed.accepted, true);
+
+    await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+      sequence: 2, commandId: 'old-lease-release-retry', type: 'request.release', request: released,
+      payload: { recoveryMode: 'stale_lease' },
+    }) });
+
+    const runtime = await h.backgroundState.read(h.state.tabId);
+    assert.equal(runtime.lease.requestId, current.requestId);
+    assert.equal(runtime.lease.leaseId, current.leaseId);
+    assert.equal(runtime.commands['old-lease-release-retry'], undefined);
+    assert.equal(h.sent.some((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED
+      && entry.body.commandId === 'old-lease-release-retry'), false);
+    assert.equal(h.sent.some((entry) => entry.messageType === ExtensionMessageType.COMMAND_REJECTED
+      && entry.body.commandId === 'old-lease-release-retry' && entry.body.code === 'BROWSER_TAB_LEASED'), true);
+  } finally { h.restore(); }
+});
+
+test('a dispatched release keeps one durable deadline until its terminal result is committed', async () => {
+  const h = backgroundHarness(106);
+  const request = { requestId: 'request-stale-deadline', leaseId: 'lease-stale-deadline', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  try {
+    await initializeHarness(h);
+    await quarantineLease(h, request);
+    await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+      sequence: 1, commandId: 'stale-deadline-release', type: 'request.release', request,
+      payload: { recoveryMode: 'stale_lease' },
+    }) });
+
+    let runtime = await h.backgroundState.read(h.state.tabId);
+    const deadlines = pendingReleaseDeadlines(runtime);
+    assert.equal(deadlines.length, 1);
+    assert.equal(deadlines[0].commandId, 'stale-deadline-release');
+    assert.equal(deadlines[0].dueAt, runtime.commands['stale-deadline-release'].dispatchedAt + 8_000);
+
+    await handleReleaseCleanupSettlement(h, h.state, {
+      commandId: 'stale-deadline-release', requestId: request.requestId, status: 'completed', released: true,
+    });
+    runtime = await h.backgroundState.read(h.state.tabId);
+    assert.deepEqual(pendingReleaseDeadlines(runtime), []);
+  } finally { h.restore(); }
+});
+
+test('bridge release promise settles from the extension terminal acknowledgement without a timeout', async () => {
+  const h = backgroundHarness(107);
+  const request = { requestId: 'request-stale-bridge', leaseId: 'lease-stale-bridge', ownerServerInstanceId: 'server-regression', responseEpoch: 0 };
+  const delivered = [];
+  const clientId = 'client-107';
+  const registry = new BridgeCommandRegistry({ hub: {
+    sendToClientWithDelivery(targetClientId, payload, options) {
+      delivered.push({ clientId: targetClientId, payload, options });
+      return { client: { id: targetClientId }, delivered: Promise.resolve() };
+    },
+  } });
+  try {
+    await initializeHarness(h);
+    await quarantineLease(h, request);
+    const pending = registry.send('request.release', { type: 'request.release', recoveryMode: 'stale_lease' }, {
+      sourceClientId: clientId, commandId: 'bridge-stale-release', request, timeoutMs: 10_000,
+    });
+    await waitFor(() => delivered.length === 1);
+    await handleServerEnvelope({ ...h, envelope: serverEnvelope({
+      sequence: 1, commandId: 'bridge-stale-release', type: 'request.release', request,
+      payload: { recoveryMode: 'stale_lease' },
+    }) });
+    await handleReleaseCleanupSettlement(h, h.state, {
+      commandId: 'bridge-stale-release', requestId: request.requestId, status: 'completed', released: true,
+    });
+
+    const runtime = await h.backgroundState.read(h.state.tabId);
+    assert.equal(runtime.lease, null);
+    const terminal = runtime.outbox.find((entry) => entry.messageType === ExtensionMessageType.LEASE_RELEASED);
+    assert.ok(terminal);
+    assert.equal(registry.handleResponse(clientId, { ...terminal.body, type: 'lease.released' }), true);
+    const result = await pending;
+    assert.equal(result.type, 'lease.released');
+    assert.equal(result.released, true);
+    assert.equal(result.commandId, 'bridge-stale-release');
+    assert.equal(registry.isReleasePending(clientId), false);
+  } finally { registry.close(); h.restore(); }
 });
 
 test('committed stale release dispatch is never sent a second time after an interruption before content post', async () => {

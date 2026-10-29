@@ -254,6 +254,27 @@ export function matchingPersistedRequestIdentity(record, value, { requireRespons
     && (!requireResponseEpoch || identity.responseEpoch === Math.max(0, Number(record.responseEpoch) || 0));
 }
 
+export const RELEASE_CLEANUP_TIMEOUT_MS = 8_000;
+
+/**
+ * Release deadlines are derived from the persisted command record so a
+ * dispatched release can still reach its single terminal after the in-memory
+ * timer was lost (service-worker restart, content reconnect, process crash).
+ * A command leaves `dispatched` when that terminal is committed, so re-arming
+ * this deadline is idempotent and never adds a second attempt.
+ */
+export function pendingReleaseDeadlines(state, timeoutMs = RELEASE_CLEANUP_TIMEOUT_MS) {
+  const limit = Math.max(1_000, Number(timeoutMs) || RELEASE_CLEANUP_TIMEOUT_MS);
+  return (state?.commandOrder || [])
+    .map((commandId) => state.commands?.[commandId])
+    .filter((command) => command && command.mode === 'release' && command.status === CommandStatus.DISPATCHED)
+    .map((command) => ({
+      commandId: String(command.commandId || ''),
+      requestId: String(command.requestId || ''),
+      dueAt: Math.max(0, Number(command.dispatchedAt) || 0) + limit,
+    }));
+}
+
 export function activeRequestChildren(state, lease) {
   const requestId = String(lease?.requestId || '');
   const leaseId = String(lease?.leaseId || '');

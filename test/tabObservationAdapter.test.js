@@ -420,3 +420,68 @@ test('accepted observation persists the proved response boundary in canonical st
   assert.equal(outcome.accepted, true);
   assert.equal(outcome.state.response.userTurnKey, 'user-1');
 });
+
+test('conversation id change canonicalizes on exact submitted turn evidence even for a non-WEB placeholder id', () => {
+  // Live regression: the tab bound "local-chatgpt:<uuid>" before ChatGPT created
+  // the real conversation, then the real id appeared together with our own user
+  // turn. Only the WEB: prefix used to be promotable, so the request died with
+  // CONVERSATION_CHANGED before its own answer existed.
+  const event = tabObservationToCanonicalEvent('req-1', 'client-1', {
+    observation: observation({
+      conversationId: '6adf7edf-cb2c-83ee-bf0f-fd83bc0eff5b',
+      activeRequest: { requestId: 'req-1', submittedUserTurnKey: 'user-1', responseEpoch: 0 },
+      turn: { key: 'assistant-1', userKey: 'user-1', index: 1, userIndex: 0 },
+    }),
+  }, {
+    source: { conversationId: 'local-chatgpt%3Aa057658a-6c08-4bca-a318-c69d340adb78' },
+    submission: 'submitted',
+    response: { epoch: 0, userTurnKey: 'user-1' },
+  }, 110);
+
+  assert.equal(event.data.conversationCanonicalized, true);
+  assert.equal(event.data.conversationChanged, false);
+  assert.equal(event.data.conversationCanonicalizationDeferred, false);
+  assert.equal(event.data.previousConversationId, 'local-chatgpt%3Aa057658a-6c08-4bca-a318-c69d340adb78');
+  assert.equal(event.data.conversationId, '6adf7edf-cb2c-83ee-bf0f-fd83bc0eff5b');
+  assert.equal(event.data.scopedToRequest, true);
+});
+
+test('conversation id change without any turn evidence keeps the placeholder binding and defers', () => {
+  const event = tabObservationToCanonicalEvent('req-1', 'client-1', {
+    observation: observation({
+      conversationId: '6adf7edf-cb2c-83ee-bf0f-fd83bc0eff5b',
+      activeRequest: { requestId: 'req-1', submittedUserTurnKey: '', responseEpoch: 0 },
+      turn: null,
+      generation: { state: 'active' },
+      output: { state: 'none', answer: '' },
+    }),
+  }, {
+    source: { conversationId: 'WEB:5e28091a-3aca-4d27-bd8c-c1ff91440544' },
+    submission: 'submitted',
+    response: { epoch: 0, userTurnKey: '' },
+  }, 110);
+
+  assert.equal(event.data.conversationCanonicalizationDeferred, true);
+  assert.equal(event.data.conversationChanged, false);
+  assert.equal(event.data.conversationCanonicalized, true);
+  assert.equal(event.data.conversationId, '', 'a deferred change must not rebind the conversation id');
+  assert.equal(event.data.scopedToRequest, false);
+  assert.equal(event.data.completionCandidate, false);
+});
+
+test('a real bound conversation changing to another real conversation stays fatal without turn evidence', () => {
+  const event = tabObservationToCanonicalEvent('req-1', 'client-1', {
+    observation: observation({
+      conversationId: 'session-2',
+      activeRequest: { requestId: 'req-1', submittedUserTurnKey: '', responseEpoch: 0 },
+      turn: null,
+    }),
+  }, {
+    source: { conversationId: 'session-1' },
+    submission: 'submitted',
+    response: { epoch: 0, userTurnKey: '' },
+  }, 110);
+
+  assert.equal(event.data.conversationCanonicalizationDeferred, false);
+  assert.equal(event.data.conversationChanged, true);
+});

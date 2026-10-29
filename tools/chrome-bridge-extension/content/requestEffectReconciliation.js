@@ -247,6 +247,16 @@
         reconciliationOutcome: outcome, reconciliationReason: reason, evidence,
       });
       diagnostic('browser.effect.reconciled', { requestId, effectId, effectType, outcome, reason, evidence });
+      // `request.effect.reconcile` is a request-scoped result-mode command, so
+      // this correlated reply is its only terminal. Without it the background
+      // keeps the command dispatched, and a dispatched command blocks the
+      // lease release that waits for the request's cleanup proof.
+      send({
+        type: 'request.effect.reconciled',
+        commandId, requestId, effectId, effectType,
+        reconciliationOutcome: outcome,
+        reconciliationReason: reason,
+      });
     }
 
 

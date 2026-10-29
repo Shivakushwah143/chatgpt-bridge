@@ -63,7 +63,7 @@ function simpleHash(input) {
 
 function findThinkingElements(root) {
   const lowerNeedle = /(thinking|reasoning|thought|дума|думаю|размыш|мысл)/i;
-  const statusNeedle = /^(?:thinking|think|думаю|размышляю)\s*(?:\.|…)?$|^(?:thought for|думал|размышлял)\b/i;
+  const statusNeedle = /^(?:thinking|think|reasoning|worked|working|думаю|размышляю)\s*(?:\.|…)?$|^(?:thought for|worked for|reasoning for|думал|размышлял)\b/i;
   return Array.from(root.querySelectorAll('*')).filter((element) => {
     const attributes = [element.getAttribute('data-testid'), element.getAttribute('aria-label'), element.getAttribute('class'), element.getAttribute('id')].filter(Boolean).join(' ');
     const text = visibleText(element);

@@ -14,6 +14,7 @@ import {
 } from '../state/requestEvents.js';
 import { EffectRunner } from '../effects/effectRunner.js';
 import { CanonicalRequestRuntime } from './canonicalRequestRuntime.js';
+import { ClientOwnershipReleaseCoordinator } from './clientOwnershipReleaseCoordinator.js';
 import { RequestRecoveryCoordinator } from './requestRecoveryCoordinator.js';
 import { RequestResultMaterializer } from './requestResultMaterializer.js';
 import { RequestCancellationCoordinator } from './requestCancellationCoordinator.js';
@@ -50,6 +51,13 @@ export class RequestLifecycleCoordinator {
         const state = this.pending.get(event.entityId);
         if (state && !isRequestRuntimeFinished(state)) this.ingestRequestTransition(state, event);
       },
+    });
+    this.ownershipRelease = new ClientOwnershipReleaseCoordinator({
+      hub,
+      getState: (requestId) => this.requestState.store.get(requestId),
+      requestIdentity: (state) => this.requestIdentity(state),
+      sendCommand,
+      eventBus,
     });
     this.results = new RequestResultMaterializer(this);
     this.cancellation = new RequestCancellationCoordinator(this);
@@ -158,21 +166,20 @@ export class RequestLifecycleCoordinator {
   });
 }
 
+  releaseClientOwnership(state, options = {}) {
+    return this.ownershipRelease.release(state, options);
+  }
+
   async executeCanonicalEffect(state, effect = {}) {
   if (!state) return null;
   if (effect.type === RequestEffectType.REQUEST_RELEASE) {
     const sourceClientId = String(effect.data?.sourceClientId || state.clientId || '');
-    if (!sourceClientId) return { released: false, reason: 'source_client_missing' };
-    const result = await this.sendCommand('request.release', {
-      requestId: state.requestId,
+    const result = await this.releaseClientOwnership(state, {
       terminalCode: effect.data?.terminalCode || '',
       reason: effect.data?.reason || 'canonical_terminal',
-    }, {
-      sourceClientId,
-      timeoutMs: 10_000,
-      request: this.requestIdentity(state),
+      source: 'canonical_effect',
     });
-    return { released: result?.released !== false, sourceClientId };
+    return { ...result, sourceClientId };
   }
   if (effect.type === RequestEffectType.PROMPT_CANCEL_RETRY) {
     const request = this.requestIdentity(state);

@@ -13,3 +13,5 @@ __MACOSX/
 *.zip
 CHANGELOG.md
 /.bridge/
+.tmp-runtime/
+.tmp-state.json

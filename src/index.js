@@ -7,6 +7,9 @@ import { spawn } from 'node:child_process';
 import { config, setupInfo } from './config.js';
 import { log, error as logError, setLogEnabled } from './logger.js';
 import { createApp } from './server.js';
+import { ProviderService } from './providers/providerService.js';
+import { DurableRequestService } from './kodevra/durableRequestService.js';
+import { createLiveResponseStream } from './kodevra/liveResponseStream.js';
 import { runDebugClient } from './debugClient.js';
 import { BrowserExtensionHub } from './browserExtensionHub.js';
 import { BrowserBridge } from './browserBridge.js';
@@ -34,6 +37,7 @@ import {
   workflowCliHelp,
 } from './cli/workflowRuntime.js';
 
+const processStartedAt = Date.now();
 const require = createRequire(import.meta.url);
 const packageInfo = require('../package.json');
 
@@ -167,7 +171,28 @@ if (isDebugClient) {
     },
   });
   const codexRpcServer = new CodexRpcServer({ turnManager, bridge, fileStore, metadataStore, eventBus, projectService });
-  const app = createApp(bridge, fileStore, eventBus, turnManager, projectService, workflowManager);
+  // Provider operations are delegated to a service that knows this process: it
+  // can describe the bridge it runs in, and it routes Stop/Restart of the bridge
+  // through the same graceful shutdown path as Ctrl+C.
+  const providerService = new ProviderService({
+    bridge,
+    processInfo: { startedAt: processStartedAt },
+    requestShutdown: () => { void shutdown('provider-control-shutdown', 0); },
+  });
+  // Durable turn lifecycle for Kodevra: a submit returns a request id at once and
+  // the long-running ChatGPT turn lives in this service, not in an HTTP socket.
+  // The live stream is display-only and never persisted; the durable record above
+  // stays the single source of truth for the final answer.
+  const liveResponseStream = createLiveResponseStream();
+  const durableRequests = new DurableRequestService({ bridge, dataDir: config.dataDir, liveStream: liveResponseStream });
+  // Extension deltas go straight to the owning durable request, never through
+  // the request event timeline or the persisted state.
+  bridge.setLiveDeltaHandler((requestId, payload) => durableRequests.acceptLiveDelta(requestId, payload));
+  const app = createApp(bridge, fileStore, eventBus, turnManager, projectService, workflowManager, {
+    providerService,
+    durableRequests,
+    liveResponseStream,
+  });
   const server = http.createServer(app);
   hub.attach(server);
   codexRpcServer.attach(server);

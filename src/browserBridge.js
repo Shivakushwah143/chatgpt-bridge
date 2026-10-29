@@ -19,6 +19,7 @@ import { BridgeCommandRegistry } from './bridge/coordinator/bridgeCommandRegistr
 import { RequestSubmissionCoordinator } from './bridge/coordinator/requestSubmissionCoordinator.js';
 import { RequestControlCoordinator } from './bridge/coordinator/requestControlCoordinator.js';
 import { StaleRequestReleaseCoordinator } from './bridge/coordinator/staleRequestReleaseCoordinator.js';
+import { StaleLeaseReconciliationCoordinator } from './bridge/coordinator/staleLeaseReconciliationCoordinator.js';
 import { PassivePromptService } from './bridge/passivePromptService.js';
 
 export { browserLaunchUrl } from './browserLaunch.js';
@@ -33,6 +34,7 @@ export class BrowserBridge {
   #fileStore;
   #eventBus;
   #pending = new Map();
+  #intelligenceMetrics = new Map();
   #artifacts;
   #observedTurnJournal = new ObservedTurnJournal({ limit: 200 });
   #lifecycle;
@@ -43,8 +45,10 @@ export class BrowserBridge {
   #submission;
   #controls;
   #staleRequestRelease;
+  #staleLeases;
   #passivePrompts;
   #runtimeOptions;
+  #liveDeltaHandler = null;
   #serverInstanceId;
 
   constructor(hub, fileStore = null, eventBus = null, runtimeOptions = {}) {
@@ -97,6 +101,14 @@ export class BrowserBridge {
         return await sent.delivered;
       },
     });
+    this.#staleLeases = new StaleLeaseReconciliationCoordinator({
+      hub: this.#hub,
+      serverInstanceId: this.#serverInstanceId,
+      getCanonicalRequestState: (requestId) => this.#lifecycle.getState(requestId),
+      releaseStaleLease: async (identity) => await this.#staleRequestRelease.releaseStaleRequestLease(identity),
+      eventBus: this.#eventBus,
+      observationFreshnessMs: config.clientStaleMs,
+    });
     this.#browserClients = new BrowserClientCoordinator({
       hub: this.#hub,
       pending: this.#pending,
@@ -104,6 +116,7 @@ export class BrowserBridge {
       runtimeOptions: this.#runtimeOptions,
       sendCommand: async (type, data, options) => await this.#sendCommand(type, data, options),
       releaseCoordinator: this.#commandRegistry,
+      staleLeases: this.#staleLeases,
     });
     this.#staleRequestRelease = new StaleRequestReleaseCoordinator({
       activeRequestCandidates: () => this.#browserClients.activeRequestCandidates(),
@@ -140,10 +153,25 @@ export class BrowserBridge {
       registerObservedArtifacts: (artifacts, defaults) => this.registerObservedArtifacts(artifacts, defaults),
       handleCommandResponse: (clientId, payload) => this.#commandRegistry.handleResponse(clientId, payload),
       sendCommand: async (type, data, options) => await this.#sendCommand(type, data, options),
+      recordIntelligenceMetrics: (clientId, metrics) => { this.#intelligenceMetrics.set(clientId, metrics); },
+      // Ownership transfer needs the client's stable launch identity, not only
+      // the connection id the message arrived on.
+      resolveClient: (clientId) => Array.from(this.#hub.clients || []).find((client) => client.id === clientId) || null,
+      // Display-only streamed text. It is delivered straight to the durable
+      // request's live channel, never through the request event timeline, so a
+      // long answer cannot flood the event bus or change request state.
+      liveDelta: (requestId, payload) => this.#liveDeltaHandler?.(requestId, payload),
     });
     const canonicalHandler = async ({ eventName, data }) => {
       if (eventName === 'client.message') return await this.#clientEvents.handleClientMessage(data.clientId, data.payload, data.envelope);
-      if (eventName === 'client.activity') return await this.#clientEvents.handleClientActivity(data.clientId, data.client, data.payload, data.envelope);
+      if (eventName === 'client.activity') {
+        const result = await this.#clientEvents.handleClientActivity(data.clientId, data.client, data.payload, data.envelope);
+        // Observations are the only projection path that refreshes a
+        // reconnected tab; a dead generation's lease must not wait for a
+        // navigation event that may never come.
+        void this.#staleLeases.reconcileClient(data.clientId, 'client_activity');
+        return result;
+      }
       return undefined;
     };
     if (typeof this.#hub.setCanonicalMessageHandler === 'function') this.#hub.setCanonicalMessageHandler(canonicalHandler);
@@ -151,9 +179,18 @@ export class BrowserBridge {
       this.#hub.on?.('client.message', (data) => canonicalHandler({ eventName: 'client.message', data }));
       this.#hub.on?.('client.activity', (data) => canonicalHandler({ eventName: 'client.activity', data }));
     }
-    this.#hub.on?.('client.ready', (client) => this.#clientEvents.handleClientReady(client));
-    this.#hub.on?.('client.changed', (client) => this.#clientEvents.handleClientChanged(client));
-    this.#hub.on?.('client.closed', (client) => this.#lifecycle.handleClientClosed(client));
+    this.#hub.on?.('client.ready', (client) => {
+      this.#clientEvents.handleClientReady(client);
+      void this.#staleLeases.reconcileClient(client.id, 'client_ready');
+    });
+    this.#hub.on?.('client.changed', (client) => {
+      this.#clientEvents.handleClientChanged(client);
+      void this.#staleLeases.reconcileClient(client.id, 'client_changed');
+    });
+    this.#hub.on?.('client.closed', (client) => {
+      this.#staleLeases.forgetClient(client.id);
+      this.#lifecycle.handleClientClosed(client);
+    });
   }
 
   get pageUrl() {
@@ -209,6 +246,7 @@ export class BrowserBridge {
         ...client,
         releasePending,
         releaseState: client.quarantined ? 'quarantined' : releasePending ? 'pending' : 'idle',
+        intelligenceMetrics: this.#intelligenceMetrics.get(client.id) || null,
       };
     });
     return {
@@ -307,6 +345,15 @@ export class BrowserBridge {
 
   debugEvents() {
     return this.#hub.debugEvents;
+  }
+
+  /**
+   * Register the display-only sink for streamed assistant text. The durable
+   * request service owns it; without a sink the deltas are simply ignored, which
+   * is exactly what a bridge without Kodevra streaming should do.
+   */
+  setLiveDeltaHandler(handler) {
+    this.#liveDeltaHandler = typeof handler === 'function' ? handler : null;
   }
 
   onClientLifecycle(handler) {

@@ -8,6 +8,8 @@
       CONFIG,
       DOM_PARSER,
       INTELLIGENCE_UI_TIMING,
+      beginIntelligenceTurn,
+      currentIntelligenceTurnMetrics,
       delay,
       diagnostic,
       emitChatEvent,
@@ -15,7 +17,11 @@
       findComposer,
       isVisible,
       openNewSession,
+      planIntelligenceAdjustment,
+      readCachedIntelligence,
       readIntelligenceState,
+      readIntelligenceTrigger,
+      recordIntelligenceConfirmation,
       schedulePageStatus,
       selectSessionById,
       send,
@@ -120,69 +126,145 @@
       }
     }
   
+    /**
+     * Idempotent model/effort preparation.
+     *
+     * Cost order: cached state, then one composer-trigger read, then - only for a
+     * dimension that actually differs - one menu interaction. A turn whose model
+     * and effort already match therefore opens no menus at all. Selection is
+     * attempted at most once per dimension, and an effort the account does not
+     * expose leaves ChatGPT on its current effort with a warning instead of
+     * retrying.
+     */
     async function applyModelOptions(options, request, { emitEvents = true } = {}) {
       const model = String(options.model || '').trim();
       const effort = String(options.effort || '').trim();
       if (!model && !effort) return;
-  
+
+      beginIntelligenceTurn();
       if (emitEvents) emitChatEvent(request, 'model.apply.started', { model, effort });
       diagnostic('model.apply.started', { requestId: request.requestId, model, effort });
-  
-      const result = { model, effort, modelApplied: false, effortApplied: false, warnings: [] };
+
+      const current = readCachedIntelligence();
+      const plan = planIntelligenceAdjustment({ model, effort, current });
+      if (!plan.model && !plan.effort) {
+        // The composer trigger just proved the live state for both dimensions,
+        // so this is a confirmation, not a guess: cache it and stop here.
+        if (current.trigger) {
+          recordIntelligenceConfirmation({
+            modelLabel: current.trigger.modelLabel,
+            effortId: current.trigger.effortId,
+            signature: current.trigger.signature,
+            source: 'composer-trigger',
+          });
+        }
+        const skipped = {
+          model,
+          effort,
+          modelApplied: Boolean(model),
+          effortApplied: Boolean(effort),
+          skipped: true,
+          reason: plan.reason,
+          warnings: [],
+          current: { model: current.modelLabel || '', effort: current.effortId || '', source: current.source },
+          interactions: currentIntelligenceTurnMetrics(),
+        };
+        diagnostic('model.apply.skipped', {
+          requestId: request.requestId,
+          model,
+          effort,
+          reason: plan.reason,
+          source: current.source,
+          interactions: skipped.interactions,
+        });
+        return skipped;
+      }
+
+      const result = { model, effort, modelApplied: false, effortApplied: false, skipped: false, reason: plan.reason, warnings: [] };
       let modelSelection = null;
       let effortSelection = null;
-  
-      if (model) {
+
+      if (model && plan.model) {
         modelSelection = await trySelectIntelligenceOption(model, 'model', request);
         if (!modelSelection.matched) result.warnings.push(`Could not find model option: ${model}`);
-        if (effort) await delay(INTELLIGENCE_UI_TIMING.betweenSelectionsMs);
       }
-  
-      if (effort) {
+
+      if (effort && plan.effort) {
         const effortLabel = effortLabelFromValue(effort);
         effortSelection = await trySelectIntelligenceOption(effortLabel, 'effort', request);
-        if (!effortSelection.matched) result.warnings.push(`Could not find effort option: ${effort}`);
+        if (!effortSelection.matched) {
+          // Documented fallback: keep whatever effort the account already has.
+          // No second attempt, no loop.
+          result.fallback = 'kept-current-effort';
+          result.warnings.push(`Effort "${effort}" is not offered by this account; kept the current ChatGPT effort.`);
+        }
       }
-  
+
+      // Verification starts with the cheap composer read; the picker is only
+      // opened when neither the trigger nor the completed selection proves the
+      // state on its own.
+      const trigger = readIntelligenceTrigger();
+      const modelSelectionProven = Boolean(modelSelection && (modelSelection.alreadySelected || modelSelection.proven));
+      const effortSelectionProven = Boolean(effortSelection && (effortSelection.alreadySelected || effortSelection.proven));
+      const modelKnown = !model
+        || (modelSelection ? modelSelectionProven : (trigger?.modelLabel ? DOM_PARSER.intelligenceOptionMatches({ label: trigger.modelLabel }, model) : null));
+      const effortKnown = !effort
+        || (effortSelection ? effortSelectionProven : (trigger?.effortId ? DOM_PARSER.intelligenceOptionMatches({ id: trigger.effortId, label: effortLabelFromValue(effort) }, effortLabelFromValue(effort)) : null));
       let state = null;
-      let verificationError = null;
-      for (let attempt = 1; attempt <= 2; attempt += 1) {
-        diagnostic('model.apply.verification.started', { requestId: request.requestId, model, effort, attempt });
+      if (modelKnown === null || effortKnown === null) {
+        diagnostic('model.apply.verification.menu_read', { requestId: request.requestId, model, effort });
         try {
           state = await readIntelligenceState({ includeModels: Boolean(model) });
-          result.modelApplied = model ? DOM_PARSER.intelligenceOptionMatches(state.selectedModel || {}, model) : false;
-          result.effortApplied = effort ? DOM_PARSER.intelligenceOptionMatches(state.selectedEffort || {}, effortLabelFromValue(effort)) : false;
-          const verified = (!model || result.modelApplied) && (!effort || result.effortApplied);
-          if (verified) break;
-          verificationError = new Error(`Picker state mismatch: model=${state.selectedModel?.label || ''} effort=${state.selectedEffort?.id || state.selectedEffort?.label || ''}`);
         } catch (err) {
-          verificationError = err;
-        }
-        if (attempt < 2) {
-          diagnostic('model.apply.verification.retry', { requestId: request.requestId, model, effort, attempt, message: verificationError?.message || 'state mismatch' });
-          await delay(INTELLIGENCE_UI_TIMING.verificationRetryMs);
+          result.warnings.push(`Verification detail: ${err.message || String(err)}`);
         }
       }
-  
+
+      const appliedModel = state?.selectedModel
+        || (trigger?.modelLabel ? { label: trigger.modelLabel } : null)
+        || (modelSelectionProven ? modelSelection?.option || null : null);
+      const appliedEffort = state?.selectedEffort
+        || (trigger?.effortId ? { id: trigger.effortId, label: trigger.effortId } : null)
+        || (effortSelectionProven ? effortSelection?.option || null : null);
+      result.modelApplied = model
+        ? Boolean(appliedModel && DOM_PARSER.intelligenceOptionMatches(appliedModel, model))
+        : false;
+      result.effortApplied = effort
+        ? Boolean(appliedEffort && DOM_PARSER.intelligenceOptionMatches(appliedEffort, effortLabelFromValue(effort)))
+        : false;
+
       if (model && !result.modelApplied) result.warnings.push(`Could not confirm model selection: ${model}`);
-      if (effort && !result.effortApplied) result.warnings.push(`Could not confirm effort selection: ${effort}`);
-      if (verificationError && result.warnings.length) result.warnings.push(`Verification detail: ${verificationError.message}`);
-  
-      const verifiedIntelligence = state ? {
-        models: Array.isArray(state.models) ? state.models : [],
-        efforts: Array.isArray(state.efforts) ? state.efforts : [],
-        selectedModel: state.selectedModel || null,
-        selectedEffort: state.selectedEffort || null,
-        capturedAt: state.capturedAt || Date.now(),
-      } : null;
-      const completedResult = { ...result, intelligence: verifiedIntelligence };
+      if (effort && !result.effortApplied && result.fallback !== 'kept-current-effort') {
+        result.warnings.push(`Could not confirm effort selection: ${effort}`);
+      }
+
+      recordIntelligenceConfirmation({
+        modelLabel: appliedModel?.label || '',
+        effortId: appliedEffort?.id || appliedEffort?.label || '',
+        signature: trigger?.signature || '',
+        source: 'model.apply',
+      });
+
+      result.current = { model: appliedModel?.label || '', effort: appliedEffort?.id || appliedEffort?.label || '', source: state ? 'picker' : 'composer-trigger' };
+      result.interactions = currentIntelligenceTurnMetrics();
+      const completedResult = {
+        ...result,
+        intelligence: state ? {
+          models: Array.isArray(state.models) ? state.models : [],
+          efforts: Array.isArray(state.efforts) ? state.efforts : [],
+          selectedModel: state.selectedModel || null,
+          selectedEffort: state.selectedEffort || null,
+          capturedAt: state.capturedAt || Date.now(),
+        } : null,
+      };
       diagnostic('model.apply.done', {
         requestId: request.requestId,
         ...completedResult,
         modelSelection: modelSelection ? { matched: modelSelection.matched, clicked: modelSelection.clicked, alreadySelected: modelSelection.alreadySelected } : null,
         effortSelection: effortSelection ? { matched: effortSelection.matched, clicked: effortSelection.clicked, alreadySelected: effortSelection.alreadySelected } : null,
-        selectedModel: state?.selectedModel?.label || '',
-        selectedEffort: state?.selectedEffort?.id || state?.selectedEffort?.label || '',
+        selectedModel: appliedModel?.label || '',
+        selectedEffort: appliedEffort?.id || appliedEffort?.label || '',
+        interactions: completedResult.interactions,
       });
       return completedResult;
     }

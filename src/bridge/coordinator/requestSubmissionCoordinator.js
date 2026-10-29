@@ -15,6 +15,7 @@ import {
   RequestTerminalCode,
 } from '../state/requestEvents.js';
 import { isRequestRuntimeFinished } from './requestRuntimeProjection.js';
+import { clientRuntimeIdentity } from './requestReattachmentCoordinator.js';
 
 /**
  * Owns construction and delivery of active bridge requests. The canonical
@@ -124,6 +125,7 @@ export class RequestSubmissionCoordinator {
       const state = {
         requestId,
         clientId: active.id,
+        launchToken: String(active.launchToken || ''),
         resolve,
         reject,
         callbacks: normalizedCallbacks,
@@ -230,6 +232,7 @@ export class RequestSubmissionCoordinator {
     const sourceClientId = String(options.sourceClientId || options.clientId || request.sourceClientId || request.clientId || '').trim();
     const clientLock = sourceClientId ? this.#retainClientMutex(sourceClientId) : null;
     const mutex = clientLock?.mutex || this.mutex;
+    let requestState = null;
     const pending = mutex.runExclusive(async () => {
       if (options.signal?.aborted) throw abortError(options.signal.reason || 'Request cancelled');
 
@@ -298,6 +301,7 @@ export class RequestSubmissionCoordinator {
           abortSignal: options.signal || null,
           abortHandler: null,
         };
+        requestState = state;
 
         const startedEvent = makeEvent('request.started', {
           requestId,
@@ -360,9 +364,23 @@ export class RequestSubmissionCoordinator {
               return;
             }
             const targetClient = target?.client || null;
-            const { client, delivered } = this.browserClients.sendPromptToClient(targetClient, promptPayload, { ...options, request: requestIdentity });
+            let client;
+            let delivered;
+            try {
+              ({ client, delivered } = this.browserClients.sendPromptToClient(targetClient, promptPayload, { ...options, request: requestIdentity }));
+            } finally {
+              // The tab is bound (or the dispatch failed); the reservation is no
+              // longer the ownership record for it.
+              state.reservedClientId = '';
+            }
             state.clientId = client.id;
-            state.reservedClientId = '';
+            // The tab's launch token is the stable identity of this browser
+            // effect: it survives navigation to /c/... and any reconnect that
+            // replaces the transient connection client id.
+            state.launchToken = String(client.launchToken || targetClient?.launchToken || '');
+            // Baseline the content-runtime identity so later readiness traffic is
+            // only treated as a reload when the runtime actually restarted.
+            state.boundContentEpoch = clientRuntimeIdentity(client) || '';
             this.lifecycle.ingestRequestTransition(state, this.lifecycle.canonicalEvent(state, RequestEventType.SOURCE_BOUND, {
               clientId: client.id,
               sessionId: chatOptions.sessionId || '',
@@ -420,7 +438,23 @@ export class RequestSubmissionCoordinator {
         return response;
       });
     });
-    return clientLock ? pending.finally(() => this.#releaseClientMutex(sourceClientId, clientLock)) : pending;
+    try {
+      return await (clientLock ? pending.finally(() => this.#releaseClientMutex(sourceClientId, clientLock)) : pending);
+    } finally {
+      // Ownership frame: however this request exited (success, canonical failure,
+      // timeout, cancellation, or a throw before binding) it no longer owns the
+      // tab. The lifecycle release is idempotent, so terminal paths that already
+      // released the lease are a no-op here.
+      if (requestState) {
+        try {
+          await this.lifecycle.releaseClientOwnership(requestState, {
+            terminalCode: String(this.lifecycle.getState(requestState.requestId)?.terminal?.code || ''),
+            reason: 'request_settled',
+            source: 'request_finally',
+          });
+        } catch {}
+      }
+    }
   }
 
   #retainClientMutex(clientId) {

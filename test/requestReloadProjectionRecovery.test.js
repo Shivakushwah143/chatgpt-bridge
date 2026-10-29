@@ -36,6 +36,28 @@ class ReloadHub extends EventEmitter {
 
 const nextTick = () => new Promise((resolve) => setImmediate(resolve));
 
+/**
+ * The content runtime the request was submitted from. A real page/content
+ * reload replaces this identity; ordinary page.state traffic keeps it.
+ */
+function emitLiveContentRuntime(hub, requestId) {
+  hub.emit('client.changed', {
+    id: 'client-1',
+    ready: true,
+    compatible: true,
+    url: 'https://chatgpt.com/c/session-1',
+    contentEpoch: 'content-live',
+    activeRequest: null,
+    tabObservation: {
+      observerId: 'observer-live',
+      activeRequest: {
+        requestId,
+        responseEpoch: 0,
+      },
+    },
+  });
+}
+
 test('reload completion uses canonical response boundary when restored content only knows the lease', async () => {
   const hub = new ReloadHub();
   const bridge = new BrowserBridge(hub);
@@ -173,6 +195,68 @@ test('reload fails recoverably when the submitted user turn disappeared instead 
 });
 
 
+test('ordinary page state updates never invalidate an effect that is still in flight', async () => {
+  const hub = new ReloadHub();
+  const bridge = new BrowserBridge(hub);
+  try {
+    const responsePromise = bridge.sendRequest({ message: 'list files' });
+    responsePromise.catch(() => {});
+    await nextTick();
+    const prompt = hub.sent.find((entry) => entry.payload.type === 'prompt.send')?.payload;
+    assert.ok(prompt);
+
+    emitLiveContentRuntime(hub, prompt.requestId);
+    hub.emit('client.message', {
+      clientId: 'client-1',
+      payload: {
+        type: 'request.effect.started',
+        requestId: prompt.requestId,
+        effectId: 'effect-model-apply',
+        effectType: 'model.apply',
+      },
+    });
+    await nextTick();
+
+    // The live tab keeps reporting page state while the extension executes the
+    // effect. Same content runtime, so none of this is reload evidence.
+    for (let revision = 1; revision <= 5; revision += 1) {
+      hub.emit('client.changed', {
+        id: 'client-1',
+        ready: true,
+        compatible: true,
+        url: 'https://chatgpt.com/c/session-1',
+        contentEpoch: 'content-live',
+        activeRequest: { requestId: prompt.requestId },
+        tabObservation: {
+          observerId: 'observer-live',
+          revision,
+          activeRequest: { requestId: prompt.requestId },
+        },
+      });
+      await nextTick();
+    }
+
+    assert.equal(
+      hub.sent.filter((entry) => entry.payload.type === 'request.effect.reconcile').length,
+      0,
+      'page state traffic must not dispatch effect reconciliation for a live effect',
+    );
+    assert.equal(
+      hub.sent.filter((entry) => entry.payload.type === 'prompt.send').length,
+      1,
+      'page state traffic must never re-dispatch prompt submission',
+    );
+    const diagnostics = bridge.requestStateDiagnostics(prompt.requestId);
+    assert.notEqual(diagnostics?.state?.blocker, 'recovery');
+    assert.equal(diagnostics?.state?.effect?.browser?.activeId, 'effect-model-apply');
+
+    bridge.cancelActive('test cleanup');
+    await nextTick();
+  } finally {
+    await bridge.close();
+  }
+});
+
 test('page change after reload reconciles a request that has not proved prompt submission yet', async () => {
   const hub = new ReloadHub();
   const bridge = new BrowserBridge(hub);
@@ -181,6 +265,10 @@ test('page change after reload reconciles a request that has not proved prompt s
     await nextTick();
     const prompt = hub.sent.find((entry) => entry.payload.type === 'prompt.send')?.payload;
     assert.ok(prompt);
+
+    // Bind the live content runtime first: only a *different* runtime identity
+    // afterwards is reload evidence.
+    emitLiveContentRuntime(hub, prompt.requestId);
 
     hub.emit('client.message', {
       clientId: 'client-1',
@@ -324,6 +412,70 @@ test('late page activity reattaches a submitted request when activeRequest appea
 
     const response = await responsePromise;
     assert.equal(response.answer, 'finished after late reload projection');
+  } finally {
+    await bridge.close();
+  }
+});
+
+test('reload reconciliation quotes the exact effect identity the browser recorded', async () => {
+  const hub = new ReloadHub();
+  const bridge = new BrowserBridge(hub);
+  try {
+    const responsePromise = bridge.sendRequest({ message: 'reconcile exact identity' });
+    await nextTick();
+    const prompt = hub.sent.find((entry) => entry.payload.type === 'prompt.send')?.payload;
+    assert.ok(prompt);
+
+    const effectIdentity = {
+      idempotencyKey: `${prompt.requestId}:prompt.submit`,
+      preconditionsHash: 'sha256-prompt-submit-preconditions',
+      preconditions: {
+        requestId: prompt.requestId,
+        leaseId: prompt.leaseId,
+        ownerServerInstanceId: prompt.ownerServerInstanceId,
+        responseEpoch: 0,
+        messageHash: 'prompt-text-hash',
+      },
+      attempt: 1,
+    };
+    const effectId = `${prompt.requestId}:prompt.submit:attempt:1`;
+    emitLiveContentRuntime(hub, prompt.requestId);
+    hub.emit('client.message', {
+      clientId: 'client-1',
+      payload: {
+        type: 'request.effect.started',
+        requestId: prompt.requestId,
+        effectId,
+        effectType: 'prompt.submit',
+        ...effectIdentity,
+      },
+    });
+    await nextTick();
+
+    hub.emit('client.changed', {
+      id: 'client-1',
+      ready: true,
+      compatible: true,
+      url: 'https://chatgpt.com/c/session-1',
+      activeRequest: null,
+      tabObservation: { observerId: 'observer-after-page-reload', activeRequest: null },
+    });
+    await nextTick();
+    await nextTick();
+
+    const reconcile = hub.sent.findLast((entry) => entry.payload.type === 'request.effect.reconcile')?.payload;
+    assert.ok(reconcile, 'a reload before prompt submission must dispatch effect reconciliation');
+    assert.equal(reconcile.effectId, effectId);
+    assert.equal(reconcile.effectType, 'prompt.submit');
+    // The extension records the logical idempotency key and preconditions hash
+    // with the effect; evidence quoting anything else is rejected on arrival.
+    assert.equal(reconcile.idempotencyKey, effectIdentity.idempotencyKey);
+    assert.equal(reconcile.preconditionsHash, effectIdentity.preconditionsHash);
+    assert.deepEqual(reconcile.preconditions, effectIdentity.preconditions);
+    assert.equal(reconcile.attempt, 1);
+
+    bridge.cancelActive('test cleanup');
+    await assert.rejects(responsePromise);
   } finally {
     await bridge.close();
   }

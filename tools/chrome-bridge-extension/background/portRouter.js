@@ -7,7 +7,9 @@ import {
 } from './standaloneCommandRecovery.js';
 
 const NON_BLOCKING_CONTENT_OPERATIONS = new Set(['bridge.download.capture.wait', 'bridge.download.capture.wait_bound']);
-const DIAGNOSTIC_TYPES = new Set(['diagnostic', 'page.status', 'page.changed', 'status', 'chat.event']);
+// response.delta is display-only and ephemeral: it rides the diagnostic channel
+// so it is never persisted to the outbox, yet still reaches the bridge router.
+const DIAGNOSTIC_TYPES = new Set(['diagnostic', 'page.status', 'page.changed', 'status', 'chat.event', 'response.delta']);
 const COMMAND_PROGRESS_TYPES = new Set(['artifact.data.started', 'artifact.data.chunk']);
 
 function isEphemeralPayload(payload = {}) {

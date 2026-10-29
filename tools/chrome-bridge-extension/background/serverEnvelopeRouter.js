@@ -1,6 +1,7 @@
 import '../shared/commandManifest.js';
 import { MessageType } from './protocolV5.js';
-import { matchingPersistedRequestIdentity } from './stateV6Core.js';
+import { CommandStatus, matchingPersistedRequestIdentity } from './stateV6Core.js';
+import { emitReleaseTerminal, replayRecordedReleaseTerminal } from './releaseTerminalAck.js';
 
 function commandDefinition(commandType = '') {
   return globalThis.ChatGptBridgeCommandManifest?.commandDefinition?.(commandType) || null;
@@ -250,16 +251,22 @@ async function handleCommand(deps) {
   }
 
   if (staleReleaseRecovery) {
-    if (!runtime.lease || !matchingPersistedRequestIdentity(runtime.lease, envelope.request, { requireResponseEpoch: true })) {
-      return rejectCommand({
-        state, envelope, payload, sendProtocolMessage,
-        code: 'BROWSER_TAB_LEASE_MISMATCH',
-        message: 'Stale release recovery requires the exact persisted request lease',
-      });
-    }
     const commandId = String(payload.commandId || envelope.commandId || '');
     const existingReleaseCommand = requestReleaseForLease(runtime, envelope.request);
     if (existingReleaseCommand && existingReleaseCommand.commandId !== commandId) {
+      // The exact lease was already released by a recorded command. A duplicate
+      // release for it is answered with that terminal result instead of leaving
+      // the caller's promise to time out on a lease that no longer exists. A
+      // tab that already holds another lease keeps rejecting with
+      // BROWSER_TAB_LEASED so its owner is never cleared by a stale ack.
+      if (existingReleaseCommand.status === CommandStatus.SUCCEEDED
+        && (!runtime.lease || matchingPersistedRequestIdentity(runtime.lease, envelope.request, { requireResponseEpoch: true }))) {
+        await emitReleaseTerminal({
+          state, backgroundState, createEnvelopeDraft, flushCriticalOutbox,
+          request: envelope.request, commandId, causationId: envelope.messageId,
+        });
+        return;
+      }
       return rejectCommand({
         state, envelope, payload, sendProtocolMessage,
         code: 'BROWSER_TAB_LEASED',
@@ -267,8 +274,21 @@ async function handleCommand(deps) {
       });
     }
     if (existingReleaseCommand && existingReleaseCommand.status !== 'registered') {
+      // Duplicate delivery of the recorded release command: replay its exact
+      // persisted terminal result once, never a second dispatch.
+      if (existingReleaseCommand.status === CommandStatus.SUCCEEDED) {
+        await replayRecordedReleaseTerminal({ state, backgroundState, command: existingReleaseCommand, flushCriticalOutbox });
+        return;
+      }
       await flushCriticalOutbox(state);
       return;
+    }
+    if (!runtime.lease || !matchingPersistedRequestIdentity(runtime.lease, envelope.request, { requireResponseEpoch: true })) {
+      return rejectCommand({
+        state, envelope, payload, sendProtocolMessage,
+        code: 'BROWSER_TAB_LEASE_MISMATCH',
+        message: 'Stale release recovery requires the exact persisted request lease',
+      });
     }
 
     const releaseBody = { commandId, requestId: envelope.request.requestId, released: true, activeRequest: null };

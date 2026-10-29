@@ -40,6 +40,15 @@ export function reduceRequestEffectTransition(state, event) {
         state: withEffectSlot(state, domain, {
           activeId: String(data.effectId || ''),
           activeType: String(data.effectType || ''),
+          // The identity the browser persisted with this effect. Any later
+          // reconciliation must quote it exactly; a derived or guessed key is
+          // rejected by the extension and can never prove the effect.
+          activeIdentity: {
+            idempotencyKey: String(data.idempotencyKey || ''),
+            preconditions: data.preconditions && typeof data.preconditions === 'object' ? data.preconditions : {},
+            preconditionsHash: String(data.preconditionsHash || ''),
+            attempt: Math.max(1, Number(data.attempt) || 1),
+          },
           startedAt: at,
           lastResult: null,
         }),
